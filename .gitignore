@@ -1,0 +1,46 @@
+__pycache__/
+*.pyc
+.venv/
+
+# Local/generated datasets and render outputs
+data/*
+!data/README.md
+!data/blender_research_v3/
+data/blender_research_v3/*
+!data/blender_research_v3/manifest.jsonl
+data/**/images/
+data/**/renders/
+data/**/render_cache/
+data/**/checkpoints/
+data/*.json
+
+# Local inference, training and model artifacts
+adapters/
+offload/
+models/
+wandb/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.whl
+*.log
+
+# Generated prediction files; selected summary reports may be force-added
+results/*.jsonl
+results/*.json
+!results/blender_v3_qwen_b0_b4_summary.json
+results/*.md
+!results/README.md
+!results/blender_v3_qwen_b4_final_error_analysis.md
+
+# Superseded local reports; keep only the final Blender v3 report public
+reports/current_status.md
+reports/final_results_v3.md
+
+# Keep editor and OS artifacts out of the repository
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,26 @@
+{
+  "project": "multiview_structured_metadata_vlm",
+  "conditions": {
+    "B0": {"images": ["views[0]"], "include_uv": false, "include_normal": false, "include_metadata": false, "train": false},
+    "B1": {"images": ["views[*]"], "include_uv": false, "include_normal": false, "include_metadata": false, "train": false},
+    "B2": {"images": ["views[*]"], "include_uv": true, "include_normal": true, "include_metadata": false, "train": false},
+    "B3": {"images": ["views[*]"], "include_uv": false, "include_normal": false, "include_metadata": true, "train": false},
+    "B4": {"images": ["views[*]"], "include_uv": false, "include_normal": false, "include_metadata": true, "train": true}
+  },
+  "generation": {
+    "views": 4,
+    "image_size": 256,
+    "seed": 7,
+    "split_by_scene": true
+  },
+  "lora": {
+    "r": 16,
+    "alpha": 32,
+    "dropout": 0.05,
+    "learning_rate": 0.00002,
+    "epochs": 2,
+    "per_device_train_batch_size": 1,
+    "gradient_accumulation_steps": 8,
+    "bf16": true
+  }
+}

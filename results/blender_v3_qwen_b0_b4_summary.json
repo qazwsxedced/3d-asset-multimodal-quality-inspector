@@ -1,0 +1,157 @@
+{
+  "b0": {
+    "n": 24,
+    "json_valid_rate": 1.0,
+    "schema_valid_rate": 0.0,
+    "quality_accuracy": 0.5,
+    "severity_accuracy": 0.20833333333333334,
+    "defect_macro_f1": 0.0,
+    "field_accuracy": {
+      "defect_types_exact": 0.0,
+      "quality": 0.5,
+      "repair_plan_exact": 0.0,
+      "severity": 0.20833333333333334
+    },
+    "latency_ms": {
+      "mean": 8567.03375,
+      "p50": 7314.97,
+      "p95": 10722.37
+    },
+    "accuracy_by_generalization": {
+      "unseen_question_type": {
+        "n": 6,
+        "quality_accuracy": 0.5,
+        "defect_macro_f1": 0.0
+      },
+      "unseen_scene": {
+        "n": 18,
+        "quality_accuracy": 0.5,
+        "defect_macro_f1": 0.0
+      }
+    }
+  },
+  "b1": {
+    "n": 24,
+    "json_valid_rate": 1.0,
+    "schema_valid_rate": 0.0,
+    "quality_accuracy": 0.5,
+    "severity_accuracy": 0.20833333333333334,
+    "defect_macro_f1": 0.0,
+    "field_accuracy": {
+      "defect_types_exact": 0.0,
+      "quality": 0.5,
+      "repair_plan_exact": 0.0,
+      "severity": 0.20833333333333334
+    },
+    "latency_ms": {
+      "mean": 7448.897083333333,
+      "p50": 6737.8,
+      "p95": 8511.33
+    },
+    "accuracy_by_generalization": {
+      "unseen_question_type": {
+        "n": 6,
+        "quality_accuracy": 0.5,
+        "defect_macro_f1": 0.0
+      },
+      "unseen_scene": {
+        "n": 18,
+        "quality_accuracy": 0.5,
+        "defect_macro_f1": 0.0
+      }
+    }
+  },
+  "b2": {
+    "n": 24,
+    "json_valid_rate": 1.0,
+    "schema_valid_rate": 0.0,
+    "quality_accuracy": 0.5,
+    "severity_accuracy": 0.20833333333333334,
+    "defect_macro_f1": 0.0,
+    "field_accuracy": {
+      "defect_types_exact": 0.0,
+      "quality": 0.5,
+      "repair_plan_exact": 0.0,
+      "severity": 0.20833333333333334
+    },
+    "latency_ms": {
+      "mean": 8293.057083333333,
+      "p50": 8551.1,
+      "p95": 10007.04
+    },
+    "accuracy_by_generalization": {
+      "unseen_question_type": {
+        "n": 6,
+        "quality_accuracy": 0.5,
+        "defect_macro_f1": 0.0
+      },
+      "unseen_scene": {
+        "n": 18,
+        "quality_accuracy": 0.5,
+        "defect_macro_f1": 0.0
+      }
+    }
+  },
+  "b3": {
+    "n": 24,
+    "json_valid_rate": 1.0,
+    "schema_valid_rate": 0.0,
+    "quality_accuracy": 0.625,
+    "severity_accuracy": 0.25,
+    "defect_macro_f1": 0.0,
+    "field_accuracy": {
+      "defect_types_exact": 0.0,
+      "quality": 0.625,
+      "repair_plan_exact": 0.0,
+      "severity": 0.25
+    },
+    "latency_ms": {
+      "mean": 7078.201666666667,
+      "p50": 6065.55,
+      "p95": 10195.52
+    },
+    "accuracy_by_generalization": {
+      "unseen_question_type": {
+        "n": 6,
+        "quality_accuracy": 0.5,
+        "defect_macro_f1": 0.0
+      },
+      "unseen_scene": {
+        "n": 18,
+        "quality_accuracy": 0.6666666666666666,
+        "defect_macro_f1": 0.0
+      }
+    }
+  },
+  "b4": {
+    "n": 24,
+    "json_valid_rate": 1.0,
+    "schema_valid_rate": 0.9583333333333334,
+    "quality_accuracy": 0.5,
+    "severity_accuracy": 0.4583333333333333,
+    "defect_macro_f1": 0.08333333333333333,
+    "field_accuracy": {
+      "defect_types_exact": 0.4166666666666667,
+      "quality": 0.5,
+      "repair_plan_exact": 0.0,
+      "severity": 0.4583333333333333
+    },
+    "latency_ms": {
+      "mean": 2398.945833333333,
+      "p50": 2039.39,
+      "p95": 3345.64
+    },
+    "accuracy_by_generalization": {
+      "unseen_question_type": {
+        "n": 6,
+        "quality_accuracy": 0.5,
+        "defect_macro_f1": 0.16666666666666666
+      },
+      "unseen_scene": {
+        "n": 18,
+        "quality_accuracy": 0.5,
+        "defect_macro_f1": 0.0
+      }
+    }
+  }
+}
