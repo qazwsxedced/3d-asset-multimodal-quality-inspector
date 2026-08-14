@@ -37,6 +37,23 @@ python scripts/run_mock_baseline.py --manifest data/synthetic/manifest.jsonl --c
 python scripts/evaluate_predictions.py --gold data/synthetic/manifest.jsonl --pred results/mock_b0.jsonl --out results/mock_b0_metrics.json
 ```
 
+Launch the local quality-inspection demo after installing `requirements-demo.txt`:
+
+```powershell
+.venv\Scripts\python.exe -m pip install -r requirements-demo.txt
+.venv\Scripts\python.exe demo\app.py
+```
+
+The demo provides rule-baseline, Qwen2.5-VL diagnosis, and hybrid review
+modes over the real Blender asset samples. It displays multi-view/UV/normal
+evidence and exports an HTML audit report. The rule checker remains the hard
+quality gate; the VLM supplies multimodal explanation and repair suggestions.
+It also accepts a local `.blend` file, runs Blender in background mode to
+produce runtime evidence, and sends the resulting asset through the same
+inspection flow.
+
+The demo acceptance paths are summarized in `reports/demo_validation.md`.
+
 Run the deterministic metadata-only baseline:
 
 ```powershell
