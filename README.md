@@ -19,6 +19,8 @@ This repository publishes source code, the data protocol, experiment configurati
 The final real-Blender results are documented in:
 
 - `reports/final_results_blender_v3.md`
+- `reports/paper_zh.md` (Chinese paper-style version)
+- `reports/paper_en.md` (English paper-style version)
 - `results/blender_v3_qwen_b0_b4_summary.json`
 - `results/blender_v3_qwen_b4_final_error_analysis.md`
 
