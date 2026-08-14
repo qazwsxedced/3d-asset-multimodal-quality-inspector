@@ -10,7 +10,7 @@ Phase 2 extends the original single-asset benchmark to a 600-sample Blender data
 - Scene-level split with no shared scene IDs across splits
 - Dataset validation errors: 0
 
-The test set contains 12 clean assets and 108 defective assets. All results below are from one Qwen2.5-VL-3B-Instruct run unless otherwise noted; they should be treated as a reproducible baseline, not a multi-seed confidence interval.
+The test set contains 12 clean assets and 108 defective assets. All results below use Qwen2.5-VL-3B-Instruct. The main B0–B4 table reports seed 42; a three-seed stability summary is included below.
 
 ## Deterministic metadata baseline
 
@@ -38,6 +38,19 @@ This baseline is an important control: low-level metadata is highly informative 
 
 B4 was trained for one epoch on 420 samples with QLoRA, rank 16, alpha 32, learning rate `2e-4`, gradient accumulation 8, and 4-bit loading. Training used 25,088–50,176 image pixels to fit an 8 GB GPU. The final training loss was `0.1141` and validation loss was `0.02128`.
 
+## Three-seed stability
+
+Three B4 runs used seeds 42, 123, and 3407 with the same split and hyperparameters. Values are mean ± sample standard deviation across the three runs:
+
+| Metric | Mean ± std |
+|---|---:|
+| Quality accuracy | 85.83% ± 4.33% |
+| Severity accuracy | 75.56% ± 6.25% |
+| Defect Macro-F1 | 82.55% ± 0.72% |
+| JSON/schema valid rate | 94.72% ± 7.70% |
+
+Unseen-scene performance was stable: quality accuracy `92.59% ± 0.64%` and defect Macro-F1 `84.19% ± 1.48%`. Unseen-question-type performance was less stable: quality accuracy `65.56% ± 19.25%` and defect Macro-F1 `52.19% ± 12.55%`.
+
 ## Generalization
 
 | Group | N | B4 quality accuracy | B4 defect Macro-F1 |
@@ -64,11 +77,10 @@ The dominant remaining failure is stretched-triangle detection. Its low-level si
 
 ## Interpretation and limitations
 
-The results support the claim that structured multimodal diagnosis can be improved substantially through task-specific LoRA adaptation. They do not support a claim of general-purpose VLM reasoning or cross-domain medical/autonomous-driving generalization. The benchmark is synthetic, one training seed has been evaluated, and the B4 adapter is not a production-quality 3D asset inspector.
+The results support the claim that structured multimodal diagnosis can be improved substantially through task-specific LoRA adaptation. They do not support a claim of general-purpose VLM reasoning or cross-domain medical/autonomous-driving generalization. The benchmark is synthetic, the question-type holdout remains unstable, and the B4 adapter is not a production-quality 3D asset inspector.
 
 ## Next experiments
 
-1. Run three B4 seeds and report mean ± standard deviation.
-2. Add targeted stretched-triangle examples and aspect-ratio wording to the training prompt.
-3. Compare metadata-only, image-only, and B4 predictions on the same fixed test IDs.
-4. Add confidence calibration and a human review threshold for deployment-style use.
+1. Add targeted stretched-triangle examples and aspect-ratio wording to the training prompt.
+2. Compare metadata-only, image-only, and B4 predictions on the same fixed test IDs.
+3. Add confidence calibration and a human review threshold for deployment-style use.
