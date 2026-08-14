@@ -37,6 +37,7 @@ def main() -> None:
     ap.add_argument("--gradient-accumulation-steps", type=int, default=8)
     ap.add_argument("--save-steps", type=int, default=100)
     ap.add_argument("--logging-steps", type=int, default=5)
+    ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--load-in-4bit", action="store_true")
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--trust-remote-code", action="store_true")
@@ -47,7 +48,7 @@ def main() -> None:
     if args.max_samples: train_rows = train_rows[:args.max_samples]
     if not train_rows: raise SystemExit("No train samples found")
     preview = [build_condition(r, "B4", args.manifest) for r in train_rows[:2]]
-    config = {"model": args.model, "condition": "B4", "train_samples": len(train_rows), "eval_samples": len(eval_rows), "max_length": args.max_length, "max_pixels": args.max_pixels, "min_pixels": args.min_pixels, "epochs": args.epochs, "learning_rate": args.learning_rate, "lora_r": args.lora_r, "lora_alpha": args.lora_alpha, "lora_dropout": args.lora_dropout, "gradient_accumulation_steps": args.gradient_accumulation_steps, "load_in_4bit": args.load_in_4bit, "bf16": args.bf16, "preview": preview}
+    config = {"model": args.model, "condition": "B4", "seed": args.seed, "train_samples": len(train_rows), "eval_samples": len(eval_rows), "max_length": args.max_length, "max_pixels": args.max_pixels, "min_pixels": args.min_pixels, "epochs": args.epochs, "learning_rate": args.learning_rate, "lora_r": args.lora_r, "lora_alpha": args.lora_alpha, "lora_dropout": args.lora_dropout, "gradient_accumulation_steps": args.gradient_accumulation_steps, "load_in_4bit": args.load_in_4bit, "bf16": args.bf16, "preview": preview}
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "run_config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
     if args.dry_run:
@@ -55,10 +56,11 @@ def main() -> None:
     try:
         import torch
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-        from transformers import AutoProcessor, BitsAndBytesConfig, Qwen2_5_VLForConditionalGeneration, Trainer, TrainingArguments
+        from transformers import AutoProcessor, BitsAndBytesConfig, Qwen2_5_VLForConditionalGeneration, Trainer, TrainingArguments, set_seed
     except ImportError as exc:
         raise SystemExit("Full LoRA training requires torch, transformers, peft and bitsandbytes. Run scripts/check_gpu_env.py first.") from exc
     if not torch.cuda.is_available(): raise SystemExit("CUDA is required for the current QLoRA training entry point.")
+    set_seed(args.seed)
     dtype = torch.bfloat16 if args.bf16 else torch.float16
     processor = AutoProcessor.from_pretrained(args.model, min_pixels=args.min_pixels, max_pixels=args.max_pixels, trust_remote_code=args.trust_remote_code)
     model_kwargs = {"torch_dtype": dtype, "device_map": "auto", "trust_remote_code": args.trust_remote_code}
@@ -72,7 +74,7 @@ def main() -> None:
     if hasattr(model, "enable_input_require_grads"): model.enable_input_require_grads()
     model.config.use_cache = False
     collator = QwenVLDataCollator(processor, "B4", str(args.manifest), max_length=args.max_length)
-    training_args = TrainingArguments(output_dir=str(args.output), num_train_epochs=args.epochs, per_device_train_batch_size=1, per_device_eval_batch_size=1, gradient_accumulation_steps=args.gradient_accumulation_steps, learning_rate=args.learning_rate, lr_scheduler_type="cosine", warmup_steps=0, weight_decay=0.01, logging_steps=args.logging_steps, save_steps=args.save_steps, save_total_limit=2, eval_strategy="steps" if eval_rows else "no", eval_steps=args.save_steps, bf16=args.bf16, fp16=not args.bf16, gradient_checkpointing=True, remove_unused_columns=False, report_to="none")
+    training_args = TrainingArguments(output_dir=str(args.output), num_train_epochs=args.epochs, per_device_train_batch_size=1, per_device_eval_batch_size=1, gradient_accumulation_steps=args.gradient_accumulation_steps, learning_rate=args.learning_rate, lr_scheduler_type="cosine", warmup_steps=0, weight_decay=0.01, logging_steps=args.logging_steps, save_steps=args.save_steps, save_total_limit=2, eval_strategy="steps" if eval_rows else "no", eval_steps=args.save_steps, bf16=args.bf16, fp16=not args.bf16, gradient_checkpointing=True, remove_unused_columns=False, report_to="none", seed=args.seed, data_seed=args.seed)
     trainer = Trainer(model=model, args=training_args, train_dataset=ManifestDataset(train_rows), eval_dataset=ManifestDataset(eval_rows) if eval_rows else None, data_collator=collator)
     trainer.train(); trainer.save_model(str(args.output)); trainer.save_state()
     print(f"saved LoRA adapter and trainer state to {args.output}")

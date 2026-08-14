@@ -68,6 +68,9 @@ python scripts/run_vlm_inference.py `
   --out results/qwen_b3.jsonl
 ```
 
+On GPUs with limited VRAM, use `--load-in-4bit` and split a large test set with
+`--start` and `--limit`; concatenate the JSONL parts before evaluation.
+
 Prepare B4 SFT data and inspect the GPU environment:
 
 ```powershell

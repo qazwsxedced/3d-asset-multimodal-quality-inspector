@@ -57,6 +57,7 @@ def main() -> None:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--max-new-tokens", type=int, default=192)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--split", choices=["train", "val", "test", "all"], default="test")
     ap.add_argument("--min-pixels", type=int, default=200704)
     ap.add_argument("--max-pixels", type=int, default=401408)
@@ -70,6 +71,9 @@ def main() -> None:
         raise SystemExit("Missing qwen-vl-utils.") from exc
     rows = read_jsonl(args.manifest)
     if args.split != "all": rows = [row for row in rows if row.get("split") == args.split]
+    if args.start < 0:
+        raise SystemExit("--start must be non-negative")
+    rows = rows[args.start:]
     if args.limit: rows = rows[:args.limit]
     outputs = []
     for row in rows:

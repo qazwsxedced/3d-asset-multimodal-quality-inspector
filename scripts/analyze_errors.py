@@ -138,8 +138,20 @@ def main() -> None:
             "clean_false_positive": clean_false_positive,
             "defect_false_negative_to_empty": clean_false_negative,
         },
-        "quality_confusion": {f"{g}->{p}": n for (g, p), n in sorted(quality_confusion.items())},
-        "severity_confusion": {f"{g}->{p}": n for (g, p), n in sorted(severity_confusion.items())},
+        "quality_confusion": {
+            f"{g}->{p}": n
+            for (g, p), n in sorted(
+                quality_confusion.items(),
+                key=lambda item: (str(item[0][0]), str(item[0][1])),
+            )
+        },
+        "severity_confusion": {
+            f"{g}->{p}": n
+            for (g, p), n in sorted(
+                severity_confusion.items(),
+                key=lambda item: (str(item[0][0]), str(item[0][1])),
+            )
+        },
         "per_defect": defect_stats,
         "by_generalization": {k: bucket_metrics(v) for k, v in sorted(by_group.items())},
         "by_question_type": {k: bucket_metrics(v) for k, v in sorted(by_question.items())},
