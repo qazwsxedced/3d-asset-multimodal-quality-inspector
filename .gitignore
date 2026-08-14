@@ -18,6 +18,8 @@ data/*.json
 adapters/
 offload/
 models/
+demo_reports/
+runtime_uploads/
 wandb/
 *.safetensors
 *.bin
