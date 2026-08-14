@@ -147,6 +147,8 @@ def build_condition(sample: dict[str, Any], condition: str, manifest_path: str |
         "请严格只输出一个 JSON 对象，不要输出 Markdown、解释或额外文字。\n"
         f"JSON 字段约束：{json.dumps(answer_schema(sample['question_type']), ensure_ascii=False)}"
     )
+    if condition == "B2":
+        prompt += "\n图像顺序：前面的图像是不同相机视角；倒数第二张是 UV layout diagnostic map；最后一张是 normal diagnostic map。"
     if condition in {"B3", "B4"}:
         metadata = compact_metadata(sample["metadata"])
         prompt += "\n低层结构化几何统计如下（它们不是诊断结论）：\n" + json.dumps(metadata, ensure_ascii=False, sort_keys=True)

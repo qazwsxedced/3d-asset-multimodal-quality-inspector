@@ -22,7 +22,9 @@ The public manifest preserves the complete protocol and relative image paths, bu
   --out data/blender_research_v3 `
   --n 120 `
   --views 4 `
-  --seed 23
+  --seed 23 `
+  --balanced-defects `
+  --asset-families ico_sphere cube cylinder cone torus
 ```
 
 Then run:

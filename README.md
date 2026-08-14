@@ -35,6 +35,17 @@ python scripts/run_mock_baseline.py --manifest data/synthetic/manifest.jsonl --c
 python scripts/evaluate_predictions.py --gold data/synthetic/manifest.jsonl --pred results/mock_b0.jsonl --out results/mock_b0_metrics.json
 ```
 
+Run the deterministic metadata-only baseline:
+
+```powershell
+python scripts/run_rule_baseline.py `
+  --manifest data/blender_research_v3/manifest.jsonl `
+  --fit-manifest data/blender_research_v3/manifest.jsonl `
+  --fit-split train `
+  --out results/rule_test.jsonl `
+  --split test
+```
+
 Inspect the assembled inputs and prompt for an experimental condition:
 
 ```powershell

@@ -20,6 +20,8 @@ from mathutils import Vector
 
 DEFECTS = ["non_manifold", "uv_overlap", "flipped_normals", "hole", "stretched_triangles", "degenerate_faces"]
 REPAIR = {"non_manifold": "merge or separate non-manifold components", "uv_overlap": "repack overlapping UV islands", "flipped_normals": "recalculate and validate face normals", "hole": "fill boundary loops and inspect watertightness", "stretched_triangles": "rebuild stretched regions with better topology", "degenerate_faces": "remove zero-area faces and re-triangulate"}
+ASSET_FAMILIES = ["ico_sphere", "cube", "cylinder", "cone", "torus"]
+MATERIAL_COLORS = [(0.35, 0.48, 0.68), (0.58, 0.32, 0.22), (0.28, 0.52, 0.36), (0.62, 0.48, 0.18)]
 
 
 def clear_scene():
@@ -37,11 +39,33 @@ def look_at(obj, target=(0, 0, 0)):
     obj.rotation_euler = (Vector(target) - obj.location).to_track_quat("-Z", "Y").to_euler()
 
 
-def make_asset(rng):
-    bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=3, radius=1.35, location=(0, 0, 1.35))
+def make_asset(rng, family=None, scale=1.0, rotation=0.0, color=None):
+    family = family or rng.choice(ASSET_FAMILIES)
+    color = color or rng.choice(MATERIAL_COLORS)
+    location = (0, 0, 1.35)
+    if family == "ico_sphere":
+        bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=3, radius=1.35, location=location)
+    elif family == "cube":
+        bpy.ops.mesh.primitive_cube_add(size=2.2, location=location)
+        bevel = bpy.context.object.modifiers.new("edge_bevel", type="BEVEL")
+        bevel.width = 0.18
+        bevel.segments = 3
+        bpy.context.view_layer.objects.active = bpy.context.object
+        bpy.ops.object.modifier_apply(modifier=bevel.name)
+    elif family == "cylinder":
+        bpy.ops.mesh.primitive_cylinder_add(vertices=32, radius=1.1, depth=2.5, location=location)
+    elif family == "cone":
+        bpy.ops.mesh.primitive_cone_add(vertices=32, radius1=1.25, radius2=0.55, depth=2.5, location=location)
+    elif family == "torus":
+        bpy.ops.mesh.primitive_torus_add(major_segments=32, minor_segments=16, major_radius=1.0, minor_radius=0.35, location=location)
+    else:
+        raise ValueError(f"unknown asset family: {family}")
     asset = bpy.context.object
     asset.name = "asset"
-    asset.data.materials.append(mat("asset_material", (0.35, 0.48, 0.68)))
+    asset.scale = (scale, scale, scale)
+    asset.rotation_euler[2] = rotation
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+    asset.data.materials.append(mat("asset_material", color))
     # The primitive does not always carry a usable UV layout in headless
     # Blender runs. Create one explicitly so the UV diagnostic image is
     # informative for both clean and defective assets.
@@ -112,17 +136,29 @@ def inject_stretched(asset):
 
 def inject_uv_overlap(asset):
     uv = asset.data.uv_layers.active or asset.data.uv_layers.new(name="UVMap")
-    polygons = [p for p in asset.data.polygons if len(p.loop_indices) >= 3]
-    if len(polygons) >= 2:
-        source = polygons[0].loop_indices[:3]
-        target = polygons[1].loop_indices[:3]
+    def uv_area(points):
+        return 0.5 * abs(sum(a[0] * b[1] - b[0] * a[1] for a, b in zip(points, points[1:] + points[:1])))
+
+    polygons = []
+    for polygon in asset.data.polygons:
+        points = [tuple(uv.data[li].uv) for li in polygon.loop_indices]
+        if len(points) >= 3 and uv_area(points) > 1e-6:
+            polygons.append(polygon)
+    for source_polygon in polygons:
+        matching = [polygon for polygon in polygons if polygon != source_polygon and len(polygon.loop_indices) == len(source_polygon.loop_indices)]
+        if not matching:
+            continue
+        source = list(source_polygon.loop_indices)
+        target = list(matching[0].loop_indices)
         coords = [uv.data[li].uv.copy() for li in source]
         for li, coord in zip(target, coords):
             uv.data[li].uv = coord
+        asset.data.update()
+        break
 
 
 INJECTORS = {"hole": inject_hole, "degenerate_faces": inject_degenerate, "flipped_normals": inject_flipped_normals, "non_manifold": inject_non_manifold, "stretched_triangles": inject_stretched, "uv_overlap": inject_uv_overlap}
-INJECTION_ORDER = ["hole", "non_manifold", "uv_overlap", "flipped_normals", "stretched_triangles", "degenerate_faces"]
+INJECTION_ORDER = ["hole", "non_manifold", "flipped_normals", "stretched_triangles", "degenerate_faces", "uv_overlap"]
 
 
 def apply_defects(asset, defects):
@@ -135,11 +171,21 @@ def geometry_stats(asset):
     mesh = asset.data
     edge_use = {}
     edge_faces = {}
+    triangle_aspects = []
     for poly in mesh.polygons:
         for a, b in zip(poly.vertices, poly.vertices[1:] + poly.vertices[:1]): edge_use[tuple(sorted((a, b)))] = edge_use.get(tuple(sorted((a, b))), 0) + 1
         for a, b in zip(poly.vertices, poly.vertices[1:] + poly.vertices[:1]):
             key = tuple(sorted((a, b)))
             edge_faces.setdefault(key, set()).add(poly.index)
+        vertices = [mesh.vertices[index].co.copy() for index in poly.vertices]
+        for index in range(1, max(1, len(vertices) - 1)):
+            if len(vertices) < 3:
+                break
+            a, b, c = vertices[0], vertices[index], vertices[index + 1]
+            lengths = [(a - b).length, (b - c).length, (c - a).length]
+            shortest = min(lengths)
+            if shortest > 1e-8:
+                triangle_aspects.append(max(lengths) / shortest)
     areas = [float(p.area) for p in mesh.polygons]
     degenerate_faces = {p.index for p in mesh.polygons if p.area < 1e-8}
     non_manifold = sum(v > 2 for v in edge_use.values())
@@ -158,6 +204,7 @@ def geometry_stats(asset):
         for edge, count in edge_use.items()
     )
     uv_overlap_ratio = 0.0
+    uv_overlap_triangle_count = 0
     if mesh.uv_layers.active:
         # Estimate UV triangle overlap by rasterizing UV space. Repeated UV
         # coordinates at seams are valid and must not be treated as overlap.
@@ -168,6 +215,7 @@ def geometry_stats(asset):
         resolution = 128
         occupancy = {}
         uv_layer = mesh.uv_layers.active
+        uv_triangles = []
 
         def edge(a, b, c):
             return (c[0] - a[0]) * (b[1] - a[1]) - (c[1] - a[1]) * (b[0] - a[0])
@@ -178,6 +226,7 @@ def geometry_stats(asset):
             points = [tuple(uv_layer.data[li].uv) for li in poly.loop_indices[:3]]
             if abs(edge(points[0], points[1], points[2])) < 1e-10:
                 continue
+            uv_triangles.append(tuple(sorted((round(x, 7), round(y, 7)) for x, y in points)))
             min_x = max(0, int(_math.floor(min(p[0] for p in points) * resolution)))
             max_x = min(resolution - 1, int(_math.ceil(max(p[0] for p in points) * resolution)))
             min_y = max(0, int(_math.floor(min(p[1] for p in points) * resolution)))
@@ -191,6 +240,8 @@ def geometry_stats(asset):
         covered = sum(v >= 1 for v in occupancy.values())
         overlapped = sum(v >= 2 for v in occupancy.values())
         uv_overlap_ratio = overlapped / covered if covered else 0.0
+        from collections import Counter
+        uv_overlap_triangle_count = sum(count - 1 for count in Counter(uv_triangles).values() if count > 1)
     # Detect winding inconsistencies on ordinary manifold edges. This is more
     # robust than comparing face normals to a radial direction: stretching a
     # valid mesh can change that radial heuristic without flipping a face.
@@ -206,7 +257,9 @@ def geometry_stats(asset):
         if len(uses) == 2 and uses[0][1] == uses[1][1]:
             flipped_faces.update(poly_index for poly_index, _ in uses)
     flipped = len(flipped_faces)
-    return {"vertex_count": len(mesh.vertices), "face_count": len(mesh.polygons), "boundary_edge_count": boundary, "non_manifold_edge_count": non_manifold, "flipped_normal_count": flipped, "degenerate_face_count": len(degenerate_faces), "uv_overlap_ratio": round(uv_overlap_ratio, 6), "triangle_area_stats": {"min": round(min(areas), 8) if areas else 0, "median": round(sorted(areas)[len(areas) // 2], 8) if areas else 0, "max": round(max(areas), 8) if areas else 0}}
+    sorted_aspects = sorted(triangle_aspects)
+    p95_index = min(len(sorted_aspects) - 1, max(0, int(len(sorted_aspects) * 0.95))) if sorted_aspects else 0
+    return {"vertex_count": len(mesh.vertices), "face_count": len(mesh.polygons), "boundary_edge_count": boundary, "non_manifold_edge_count": non_manifold, "flipped_normal_count": flipped, "degenerate_face_count": len(degenerate_faces), "uv_overlap_ratio": round(uv_overlap_ratio, 6), "uv_overlap_triangle_count": uv_overlap_triangle_count, "triangle_area_stats": {"min": round(min(areas), 8) if areas else 0, "median": round(sorted(areas)[len(areas) // 2], 8) if areas else 0, "max": round(max(areas), 8) if areas else 0}, "triangle_aspect_stats": {"median": round(sorted_aspects[len(sorted_aspects) // 2], 8) if sorted_aspects else 0, "p95": round(sorted_aspects[p95_index], 8) if sorted_aspects else 0, "max": round(max(sorted_aspects), 8) if sorted_aspects else 0}}
 
 
 def setup_camera(scene, view, views):
@@ -356,6 +409,7 @@ def main(argv):
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--clean-prob", type=float, default=0.25)
     ap.add_argument("--balanced-defects", action="store_true")
+    ap.add_argument("--asset-families", nargs="+", choices=ASSET_FAMILIES, default=ASSET_FAMILIES)
     args = ap.parse_args(argv)
     if not 0.0 <= args.clean_prob <= 1.0:
         ap.error("--clean-prob must be between 0 and 1")
@@ -364,7 +418,12 @@ def main(argv):
     defect_cursor = 0
     test_defect_cursor = 0
     for i in range(args.n):
-        clear_scene(); scene_id = f"asset_{i:05d}"; asset = make_asset(rng)
+        clear_scene(); scene_id = f"asset_{i:05d}"
+        asset_family = rng.choice(args.asset_families)
+        asset_scale = round(rng.uniform(0.88, 1.12), 4)
+        asset_rotation = round(rng.uniform(-math.pi, math.pi), 4)
+        asset_color = rng.choice(MATERIAL_COLORS)
+        asset = make_asset(rng, asset_family, asset_scale, asset_rotation, asset_color)
         split = "test" if i % 10 in (0, 1) else ("val" if i % 10 == 2 else "train")
         test_ordinal = (i // 10) * 2 + (i % 10) if split == "test" else -1
         if split == "test":
@@ -389,12 +448,12 @@ def main(argv):
         apply_defects(asset, defects)
         scene = configure_render(); views = []
         for view in range(args.views):
-            clear_scene(); asset = make_asset(rng)
+            clear_scene(); asset = make_asset(rng, asset_family, asset_scale, asset_rotation, asset_color)
             apply_defects(asset, defects)
             setup_camera(scene, view, args.views)
             rel = f"images/{scene_id}/view_{view}.png"; render(scene, args.out / rel); views.append(rel)
         # Render UV and normal diagnostics from the same defective asset.
-        clear_scene(); asset = make_asset(rng)
+        clear_scene(); asset = make_asset(rng, asset_family, asset_scale, asset_rotation, asset_color)
         apply_defects(asset, defects)
         setup_camera(scene, 0, args.views)
         stats = geometry_stats(asset)
@@ -411,7 +470,7 @@ def main(argv):
         question = {"quality_summary": "请判断这个 3D 资产是否通过质量检查，并列出主要问题。", "defect_detection": "请识别这个 3D 资产中存在的拓扑、UV 和法线问题。", "severity": "请评估这个 3D 资产的质量问题严重程度。", "repair_planning": "请根据发现的质量问题给出最短的修复计划。"}[qtype]
         answer = {"quality": "pass" if not defects else "fail", "defect_types": defects, "severity": severity}
         if qtype == "repair_planning": answer["repair_plan"] = [REPAIR[d] for d in defects] if defects else ["no repair required"]
-        manifest.append({"id": f"sample_{i:06d}", "scene_id": scene_id, "split": split, "generalization": generalization, "question_type": qtype, "question": question, "answer": answer, "images": {"views": views, "uv": uv_rel, "normal": normal_rel}, "metadata": {"asset_id": scene_id, **stats, "camera_views": [{"id": v, "azimuth": v * 360 / args.views, "elevation": 20} for v in range(args.views)]}})
+        manifest.append({"id": f"sample_{i:06d}", "scene_id": scene_id, "split": split, "generalization": generalization, "question_type": qtype, "question": question, "answer": answer, "images": {"views": views, "uv": uv_rel, "normal": normal_rel}, "metadata": {"asset_id": scene_id, "asset_family": asset_family, "asset_scale": asset_scale, **stats, "camera_views": [{"id": v, "azimuth": v * 360 / args.views, "elevation": 20} for v in range(args.views)]}})
     with (args.out / "manifest.jsonl").open("w", encoding="utf-8") as f:
         for row in manifest: f.write(json.dumps(row, ensure_ascii=False) + "\n")
     print("wrote", len(manifest), "samples")
