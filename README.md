@@ -30,12 +30,13 @@ baseline, B0-B4 VLM comparisons, three-seed B4 stability analysis, and a local
 - `reports/paper_en.md` (English paper-style version)
 - `reports/demo_validation.md`
 - `reports/demo_reports/` (sanitized HTML evidence from the local demo)
+- `results/blender_v3_qwen_b0_b4_summary.json`
+- `results/blender_v3_qwen_b4_final_error_analysis.md`
 
 The v3 report is retained as the original single-asset research milestone;
 the v5 report should be used when quoting the final multi-asset benchmark.
 Selected v3 aggregate files are retained under `results/` for compact
 reproducibility examples.
-
 Mock/Pillow data is used only to validate the engineering pipeline. It must not be used as a substitute for the real Blender test results.
 
 ## Quick start
@@ -90,7 +91,6 @@ The batch runner isolates each asset, retries Blender failures, records
 attempts and stdout/stderr tails, and reports mean/P50/P95 preprocessing time.
 The included external fixture set is controlled Blender-generated validation
 data, not customer-owned or manually annotated production data.
-
 Run the deterministic metadata-only baseline:
 
 ```powershell
