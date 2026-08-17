@@ -16,13 +16,25 @@ The project decomposes the task into five controlled conditions:
 
 This repository publishes source code, the data protocol, experiment configurations, aggregate metrics, and error analysis. Batch-rendered images, model weights, LoRA adapters, inference offload caches, and per-sample prediction files are local experiment artifacts and are excluded from Git.
 
-The final real-Blender results are documented in:
+The current research release is the multi-asset Blender benchmark. It contains
+600 samples across five asset families, a deterministic metadata-only rule
+baseline, B0-B4 VLM comparisons, three-seed B4 stability analysis, and a local
+`.blend` upload demo. The main results are documented in:
 
+- `reports/phase2_results_blender_v5.md`
+- `reports/engineering_delivery_summary.md`
+- `reports/external_validation_v1.md`
+- `reports/demo_recording_script.md`
 - `reports/final_results_blender_v3.md`
 - `reports/paper_zh.md` (Chinese paper-style version)
 - `reports/paper_en.md` (English paper-style version)
-- `results/blender_v3_qwen_b0_b4_summary.json`
-- `results/blender_v3_qwen_b4_final_error_analysis.md`
+- `reports/demo_validation.md`
+- `reports/demo_reports/` (sanitized HTML evidence from the local demo)
+
+The v3 report is retained as the original single-asset research milestone;
+the v5 report should be used when quoting the final multi-asset benchmark.
+Selected v3 aggregate files are retained under `results/` for compact
+reproducibility examples.
 
 Mock/Pillow data is used only to validate the engineering pipeline. It must not be used as a substitute for the real Blender test results.
 
@@ -45,7 +57,7 @@ Launch the local quality-inspection demo after installing `requirements-demo.txt
 ```
 
 The demo provides rule-baseline, Qwen2.5-VL diagnosis, and hybrid review
-modes over the real Blender asset samples. It displays multi-view/UV/normal
+modes over Blender-generated research assets and uploaded `.blend` fixtures. It displays multi-view/UV/normal
 evidence and exports an HTML audit report. The rule checker remains the hard
 quality gate; the VLM supplies multimodal explanation and repair suggestions.
 It also accepts a local `.blend` file, runs Blender in background mode to
@@ -53,6 +65,31 @@ produce runtime evidence, and sends the resulting asset through the same
 inspection flow.
 
 The demo acceptance paths are summarized in `reports/demo_validation.md`.
+
+Run the external `.blend` validation path and compare the three inspection
+policies on the same inputs:
+
+```powershell
+blender -b -P blender/generate_external_validation_set.py -- `
+  --out data/external_blend_validation_v1 --n-per-category 4 --seed 31
+
+python scripts/run_external_batch.py `
+  --assets-dir data/external_blend_validation_v1 `
+  --out results/external_batch_v1 `
+  --blender "C:\Program Files\Blender Foundation\Blender 5.2\blender.exe" `
+  --retries 2
+
+python scripts/compare_modes.py `
+  --gold results/external_batch_v1/manifest.jsonl `
+  --rule results/external_batch_v1/rule_predictions.jsonl `
+  --vlm results/external_batch_v1/vlm_predictions.jsonl `
+  --out-dir results/external_batch_v1/comparison
+```
+
+The batch runner isolates each asset, retries Blender failures, records
+attempts and stdout/stderr tails, and reports mean/P50/P95 preprocessing time.
+The included external fixture set is controlled Blender-generated validation
+data, not customer-owned or manually annotated production data.
 
 Run the deterministic metadata-only baseline:
 

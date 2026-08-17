@@ -18,8 +18,10 @@ data/*.json
 adapters/
 offload/
 models/
-demo_reports/
+/demo_reports/
 runtime_uploads/
+deliverables/
+presentation_build/
 wandb/
 *.safetensors
 *.bin
@@ -32,6 +34,8 @@ wandb/
 # Generated prediction files; selected summary reports may be force-added
 results/*.jsonl
 results/*.json
+results/external_batch_v1/
+results/real_blend_validation_v1/
 !results/blender_v3_qwen_b0_b4_summary.json
 results/*.md
 !results/README.md
@@ -40,6 +44,8 @@ results/*.md
 # Superseded local reports; keep only the final Blender v3 report public
 reports/current_status.md
 reports/final_results_v3.md
+!reports/demo_reports/
+!reports/demo_reports/*.html
 
 # Keep editor and OS artifacts out of the repository
 .idea/
