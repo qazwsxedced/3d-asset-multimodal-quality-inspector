@@ -167,7 +167,7 @@ def apply_defects(asset, defects):
         INJECTORS[defect](asset)
 
 
-def geometry_stats(asset):
+def geometry_stats(asset, max_uv_triangles=50000):
     mesh = asset.data
     edge_use = {}
     edge_faces = {}
@@ -205,6 +205,8 @@ def geometry_stats(asset):
     )
     uv_overlap_ratio = 0.0
     uv_overlap_triangle_count = 0
+    uv_overlap_sampled = False
+    uv_overlap_analyzed_triangle_count = 0
     if mesh.uv_layers.active:
         # Estimate UV triangle overlap by rasterizing UV space. Repeated UV
         # coordinates at seams are valid and must not be treated as overlap.
@@ -220,13 +222,18 @@ def geometry_stats(asset):
         def edge(a, b, c):
             return (c[0] - a[0]) * (b[1] - a[1]) - (c[1] - a[1]) * (b[0] - a[0])
 
-        for poly in mesh.polygons:
+        polygon_step = max(1, int(math.ceil(len(mesh.polygons) / max(1, int(max_uv_triangles)))))
+        uv_overlap_sampled = polygon_step > 1
+        for poly_index, poly in enumerate(mesh.polygons):
+            if poly_index % polygon_step:
+                continue
             if len(poly.loop_indices) < 3:
                 continue
             points = [tuple(uv_layer.data[li].uv) for li in poly.loop_indices[:3]]
             if abs(edge(points[0], points[1], points[2])) < 1e-10:
                 continue
             uv_triangles.append(tuple(sorted((round(x, 7), round(y, 7)) for x, y in points)))
+            uv_overlap_analyzed_triangle_count += 1
             min_x = max(0, int(_math.floor(min(p[0] for p in points) * resolution)))
             max_x = min(resolution - 1, int(_math.ceil(max(p[0] for p in points) * resolution)))
             min_y = max(0, int(_math.floor(min(p[1] for p in points) * resolution)))
@@ -259,7 +266,7 @@ def geometry_stats(asset):
     flipped = len(flipped_faces)
     sorted_aspects = sorted(triangle_aspects)
     p95_index = min(len(sorted_aspects) - 1, max(0, int(len(sorted_aspects) * 0.95))) if sorted_aspects else 0
-    return {"vertex_count": len(mesh.vertices), "face_count": len(mesh.polygons), "boundary_edge_count": boundary, "non_manifold_edge_count": non_manifold, "flipped_normal_count": flipped, "degenerate_face_count": len(degenerate_faces), "uv_overlap_ratio": round(uv_overlap_ratio, 6), "uv_overlap_triangle_count": uv_overlap_triangle_count, "triangle_area_stats": {"min": round(min(areas), 8) if areas else 0, "median": round(sorted(areas)[len(areas) // 2], 8) if areas else 0, "max": round(max(areas), 8) if areas else 0}, "triangle_aspect_stats": {"median": round(sorted_aspects[len(sorted_aspects) // 2], 8) if sorted_aspects else 0, "p95": round(sorted_aspects[p95_index], 8) if sorted_aspects else 0, "max": round(max(sorted_aspects), 8) if sorted_aspects else 0}}
+    return {"vertex_count": len(mesh.vertices), "face_count": len(mesh.polygons), "boundary_edge_count": boundary, "non_manifold_edge_count": non_manifold, "flipped_normal_count": flipped, "degenerate_face_count": len(degenerate_faces), "uv_overlap_ratio": round(uv_overlap_ratio, 6), "uv_overlap_triangle_count": uv_overlap_triangle_count, "uv_overlap_analysis_sampled": uv_overlap_sampled, "uv_overlap_analyzed_triangle_count": uv_overlap_analyzed_triangle_count, "triangle_area_stats": {"min": round(min(areas), 8) if areas else 0, "median": round(sorted(areas)[len(areas) // 2], 8) if areas else 0, "max": round(max(areas), 8) if areas else 0}, "triangle_aspect_stats": {"median": round(sorted_aspects[len(sorted_aspects) // 2], 8) if sorted_aspects else 0, "p95": round(sorted_aspects[p95_index], 8) if sorted_aspects else 0, "max": round(max(sorted_aspects), 8) if sorted_aspects else 0}}
 
 
 def setup_camera(scene, view, views):

@@ -1,0 +1,21 @@
+{
+  "max_faces": 50000,
+  "max_uv_overlap_ratio": 0.001,
+  "max_triangle_aspect_p95": 8.0,
+  "max_texture_size": 4096,
+  "min_texture_size": 512,
+  "max_material_slots": 8,
+  "max_draw_calls": 100,
+  "max_texture_memory_bytes": 1073741824,
+  "max_estimated_load_time_seconds": 8.0,
+  "max_influences_per_vertex": 4,
+  "weight_sum_tolerance": 0.05,
+  "max_unbound_vertex_ratio": 0.01,
+  "max_weight_error_ratio": 0.01,
+  "max_material_slots_per_object": 8,
+  "max_diagnostic_triangles": 50000,
+  "max_component_gap_pairs": 200000,
+  "job_timeout_seconds": 600,
+  "preview_views": 4,
+  "preview_resolution": 192
+}

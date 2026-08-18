@@ -31,6 +31,10 @@ wandb/
 *.whl
 *.log
 
+# Generated inspection fixtures and Blender inspection outputs
+tests/inspection_assets/generated/
+tests/inspection_assets/inspection_results*/
+
 # Generated prediction files; selected summary reports may be force-added
 results/*.jsonl
 results/*.json

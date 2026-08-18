@@ -22,8 +22,10 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
+from queue import Empty, Queue
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.data_protocol import build_condition, compact_metadata, read_jsonl
+from src.quality_scoring import compute_health_score
 from scripts.run_rule_baseline import infer_defects, infer_severity
 from scripts.run_vlm_inference import load_stack, parse_json_object
 
@@ -38,6 +41,7 @@ from scripts.run_vlm_inference import load_stack, parse_json_object
 DEFAULT_MANIFEST = ROOT / "data" / "blender_research_v5_multiasset" / "manifest.jsonl"
 DEFAULT_ADAPTER = ROOT / "adapters" / "qwen_b4_blender_v5_fast"
 DEFAULT_MODEL = "Qwen/Qwen2.5-VL-3B-Instruct"
+DEFAULT_THRESHOLDS = ROOT / "config" / "inspection_thresholds.json"
 REPORT_DIR = ROOT / "demo_reports"
 RUNTIME_DIR = ROOT / "runtime_uploads"
 BLENDER_CANDIDATES = [
@@ -45,7 +49,350 @@ BLENDER_CANDIDATES = [
     Path("C:/Program Files/Blender Foundation/Blender 5.2/blender.exe"),
 ]
 
+ASSET_PROFILE_CHOICES = [
+    "Auto",
+    "Realtime / XR",
+    "Visual display / open surface",
+    "3D printing / watertight",
+    "Character / animation",
+]
+
+
+def resolve_asset_profile(profile: str, metadata: dict[str, Any], target_face_budget: str = "Auto") -> str:
+    """Resolve an explicit asset-use profile without guessing from appearance."""
+    if profile and profile != "Auto":
+        return profile
+    if metadata.get("source_has_armature") or metadata.get("source_has_animation"):
+        return "Character / animation"
+    if target_face_budget != "Auto":
+        return "Realtime / XR"
+    return "Auto"
+
+
+def boundary_policy_for_profile(profile: str) -> str:
+    """Only watertight-oriented delivery treats every boundary as a hole."""
+    return "strict" if profile in {"Auto", "3D printing / watertight"} else "open_surface_allowed"
+
+
+PROFILE_LABELS = {
+    "static_geometry": ("静态几何", "Static geometry"),
+    "realtime_or_xr": ("实时 / XR", "Realtime / XR"),
+    "visual_display": ("视觉展示 / 开放表面", "Visual display / open surface"),
+    "3d_printing": ("3D 打印 / 水密", "3D printing / watertight"),
+    "character_or_animated": ("角色 / 动画", "Character / animation"),
+    "textured_asset": ("纹理资产", "Textured asset"),
+}
+
+
+def _profile_label(profile: str, language: str) -> str:
+    labels = PROFILE_LABELS.get(profile, (profile or "—", profile or "—"))
+    return labels[0] if language == "中文" else labels[1]
+
+
+def _profile_component_text(health: dict[str, Any], language: str) -> str:
+    labels = {
+        "geometry_and_defects": ("几何", "Geometry"),
+        "uv": ("UV", "UV"),
+        "materials": ("材质", "Materials"),
+        "material_and_uv": ("UV/材质", "UV/material"),
+        "runtime": ("运行时", "Runtime"),
+        "skinning": ("蒙皮", "Skinning"),
+        "animation": ("动画", "Animation"),
+    }
+    components = health.get("score_components", {})
+    parts = []
+    for key, value in components.items():
+        if key in health.get("profile_fit_applicable_weights", {}) and isinstance(value, (int, float)):
+            parts.append(f"{labels.get(key, (key, key))[0 if language == '中文' else 1]} {value:.0f}")
+    return " · ".join(parts) if parts else ("暂无分项" if language == "中文" else "No component scores")
+
+
+def _profile_excluded_text(health: dict[str, Any], language: str) -> str:
+    labels = {
+        "geometry_and_defects": ("几何", "Geometry"),
+        "uv": ("UV", "UV"),
+        "materials": ("材质", "Materials"),
+        "runtime": ("运行时", "Runtime"),
+        "skinning": ("蒙皮", "Skinning"),
+        "animation": ("动画", "Animation"),
+    }
+    excluded = health.get("profile_fit_excluded_components", [])
+    names = [labels.get(key, (key, key))[0 if language == "中文" else 1] for key in excluded]
+    return ", ".join(names) if names else ("无" if language == "中文" else "None")
+
+
+def _profile_contribution_text(health: dict[str, Any], language: str) -> str:
+    labels = {
+        "geometry_and_defects": ("几何", "Geometry"),
+        "uv": ("UV", "UV"),
+        "materials": ("材质", "Materials"),
+        "runtime": ("运行时", "Runtime"),
+        "skinning": ("蒙皮", "Skinning"),
+        "animation": ("动画", "Animation"),
+    }
+    status_labels = {
+        "checked": ("已检查", "checked"),
+        "sampled": ("采样估计", "sampled estimate"),
+        "not_checked": ("未检测", "not checked"),
+        "not_applicable": ("不适用", "not applicable"),
+    }
+    parts = []
+    for item in health.get("profile_fit_contributions", []):
+        key = item.get("component", "—")
+        label = labels.get(key, (key, key))[0 if language == "中文" else 1]
+        score = item.get("score", "—")
+        weight = item.get("weight")
+        weight_text = f"{weight * 100:.0f}%" if isinstance(weight, (int, float)) else "—"
+        penalty = item.get("penalty_total", 0)
+        raw_status = item.get("status", "—")
+        status = status_labels.get(raw_status, (raw_status, raw_status))[0 if language == "中文" else 1]
+        if language == "中文":
+            parts.append(f"{label} {score}（权重 {weight_text}，扣分 {penalty}，{status}）")
+        else:
+            parts.append(f"{label} {score} (weight {weight_text}, penalty {penalty}, {status})")
+    return "；".join(parts) if parts else ("暂无贡献明细" if language == "中文" else "No contribution details")
+
+
+def _profile_risk_text(health: dict[str, Any], language: str) -> str:
+    labels = {
+        "geometry_and_defects": ("几何", "Geometry"),
+        "uv": ("UV", "UV"),
+        "materials": ("材质", "Materials"),
+        "runtime": ("运行时", "Runtime"),
+        "skinning": ("蒙皮", "Skinning"),
+        "animation": ("动画", "Animation"),
+    }
+    items = health.get("profile_fit_risk_items", [])
+    parts = []
+    for item in items[:3]:
+        key = item.get("component", "—")
+        label = labels.get(key, (key, key))[0 if language == "中文" else 1]
+        priority = item.get("priority_score", 0)
+        status = item.get("status", "—")
+        penalties = item.get("penalties", [])
+        if penalties:
+            reason = ", ".join(str(p.get("code", "issue")) for p in penalties[:2])
+        elif item.get("coverage", 1.0) < 1.0:
+            reason = "覆盖不足" if language == "中文" else "limited coverage"
+        else:
+            reason = "分项缺口" if language == "中文" else "quality gap"
+        if language == "中文":
+            parts.append(f"{label}（优先级 {priority}，{reason}，{status}）")
+        else:
+            parts.append(f"{label} (priority {priority}, {reason}, {status})")
+    return "、".join(parts) if parts else ("暂无突出风险" if language == "中文" else "No prominent profile risk")
+
 _MODEL_CACHE: dict[str, Any] = {}
+_ACTIVE_PROCESSES: dict[str, subprocess.Popen] = {}
+try:
+    from gradio import Progress as _GradioProgress
+    _DEFAULT_PROGRESS = _GradioProgress()
+except ImportError:
+    _DEFAULT_PROGRESS = None
+
+
+def _progress_update(progress: Any, value: float, description: str) -> None:
+    if callable(progress):
+        progress(value, desc=description)
+
+
+def cancel_running_jobs() -> str:
+    """Terminate active Blender subprocesses started by this demo."""
+    cancelled = 0
+    for process in list(_ACTIVE_PROCESSES.values()):
+        if process.poll() is None:
+            process.terminate()
+            cancelled += 1
+    return f"Cancellation requested for {cancelled} active job(s)."
+
+
+def run_blender_job(command: list[str], job_dir: Path, progress: Any = None, timeout: int = 240) -> Path:
+    """Run Blender with persistent logs, stage tracking, and actionable failures."""
+    log_path = job_dir / "blender.log"
+    output_queue: Queue[str | None] = Queue()
+    process = subprocess.Popen(command, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, bufsize=1)
+    _ACTIVE_PROCESSES[str(job_dir)] = process
+    started = time.monotonic()
+
+    def read_output() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            output_queue.put(line)
+        output_queue.put(None)
+
+    reader = threading.Thread(target=read_output, daemon=True)
+    reader.start()
+    lines: list[str] = []
+    last_line = ""
+    timed_out = False
+    stage = 0.16
+    descriptions = [
+        ("OBJ/FBX/Blend 导入阶段", 0.22),
+        ("几何、材质和动画统计阶段", 0.52),
+        ("多视图和诊断图渲染阶段", 0.78),
+        ("运行时报告整理阶段", 0.92),
+    ]
+    current_stage = descriptions[0][0]
+    _progress_update(progress, stage, descriptions[0][0])
+    finished = False
+    while not finished:
+        try:
+            line = output_queue.get(timeout=0.2)
+            if line is None:
+                finished = True
+                continue
+            lines.append(line)
+            last_line = line.strip()
+            lowered = line.lower()
+            if "obj import" in lowered or "fbx" in lowered or "read blend" in lowered:
+                current_stage = descriptions[0][0]
+                _progress_update(progress, descriptions[0][1], descriptions[0][0])
+            elif "inspect_asset.py" in lowered or "statistics" in lowered or "stats" in lowered or "analy" in lowered:
+                current_stage = descriptions[1][0]
+                _progress_update(progress, descriptions[1][1], descriptions[1][0])
+            elif "starting gltf" in lowered or "render" in lowered or "saved:" in lowered:
+                current_stage = descriptions[2][0]
+                _progress_update(progress, descriptions[2][1], descriptions[2][0])
+            elif "manifest" in lowered or "report" in lowered:
+                current_stage = descriptions[3][0]
+                _progress_update(progress, descriptions[3][1], descriptions[3][0])
+        except Empty:
+            if process.poll() is not None and not reader.is_alive():
+                finished = True
+        if time.monotonic() - started > timeout:
+            timed_out = True
+            process.kill()
+            lines.append(f"Timed out after {timeout}s during {current_stage}\n")
+            break
+    reader.join(timeout=2)
+    return_code = process.wait(timeout=10)
+    _ACTIVE_PROCESSES.pop(str(job_dir), None)
+    elapsed = round(time.monotonic() - started, 1)
+    log_text = "".join(lines)
+    log_path.write_text(log_text, encoding="utf-8", errors="replace")
+    status_path = job_dir / "job_status.json"
+    status = {
+        "command": command,
+        "return_code": return_code,
+        "timed_out": timed_out,
+        "timeout_seconds": timeout,
+        "elapsed_seconds": elapsed,
+        "last_stage": current_stage,
+        "last_output": last_line,
+        "log_file": str(log_path),
+    }
+    status_path.write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
+    if timed_out:
+        stage_suggestions = {
+            descriptions[0][0]: "检查文件是否过大、是否包含复杂外部链接或损坏的 FBX/Blend 数据；必要时先用轻量导出验证。",
+            descriptions[1][0]: "降低诊断三角形上限、暂时关闭复杂动画/组件分析，或延长 job_timeout_seconds。",
+            descriptions[2][0]: "减少 preview_views 和 preview_resolution，先完成规则统计，再单独生成高分辨率预览。",
+            descriptions[3][0]: "检查磁盘空间、runtime_uploads 目录权限和 Blender 日志中的报告写入错误。",
+        }
+        suggestion = stage_suggestions.get(current_stage, "查看 Blender 日志尾部，并根据当前阶段调整检测配置。")
+        tail = log_text[-5000:]
+        raise RuntimeError(
+            f"Blender job timed out after {elapsed}s during {current_stage}. "
+            f"Log: {log_path}\nStatus: {status_path}\n"
+            f"建议 / Suggested action: {suggestion}\n{tail}"
+        )
+    if return_code != 0:
+        tail = log_text[-5000:]
+        raise RuntimeError(f"Blender job failed (exit={return_code}) during {current_stage}. Log: {log_path}\nStatus: {status_path}\n{tail}")
+    _progress_update(progress, 1.0, "检测任务完成")
+    return log_path
+
+
+def load_thresholds(path: Path = DEFAULT_THRESHOLDS) -> dict[str, Any]:
+    """Load project-specific inspection thresholds with safe defaults."""
+    defaults = {
+        "max_faces": 50_000,
+        "max_uv_overlap_ratio": 0.001,
+        "max_triangle_aspect_p95": 8.0,
+        "max_texture_size": 4096,
+        "min_texture_size": 512,
+        "max_material_slots": 8,
+        "max_draw_calls": 100,
+        "max_texture_memory_bytes": 1_073_741_824,
+        "max_estimated_load_time_seconds": 8.0,
+        "max_influences_per_vertex": 4,
+        "weight_sum_tolerance": 0.05,
+        "max_diagnostic_triangles": 50_000,
+        "max_component_gap_pairs": 200_000,
+        "job_timeout_seconds": 600,
+        "preview_views": 4,
+        "preview_resolution": 192,
+    }
+    if not path.exists():
+        return defaults
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        defaults.update({key: value for key, value in loaded.items() if key in defaults})
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
+    return defaults
+
+
+def resolve_threshold_path(text: str | None) -> Path:
+    path = Path((text or str(DEFAULT_THRESHOLDS)).strip()).expanduser()
+    if not path.is_absolute():
+        path = (ROOT / path).resolve()
+    if not path.exists():
+        raise ValueError(f"Threshold config not found: {path}")
+    return path
+
+DEFECT_LABELS_ZH = {
+    "non_manifold": "非流形几何",
+    "uv_overlap": "UV 重叠",
+    "flipped_normals": "法线翻转",
+    "hole": "模型孔洞",
+    "stretched_triangles": "三角形拉伸",
+    "degenerate_faces": "退化面",
+}
+DEFECT_LABELS_EN = {
+    "non_manifold": "non-manifold geometry",
+    "uv_overlap": "UV overlap",
+    "flipped_normals": "flipped normals",
+    "hole": "mesh hole",
+    "stretched_triangles": "stretched triangles",
+    "degenerate_faces": "degenerate faces",
+}
+REPAIR_LABELS_ZH = {
+    "non_manifold": "合并或拆分非流形组件",
+    "uv_overlap": "重新打包重叠的 UV 岛",
+    "flipped_normals": "重新计算并验证面法线",
+    "hole": "填补边界环并检查模型封闭性",
+    "stretched_triangles": "用更合理的拓扑重建拉伸区域",
+    "degenerate_faces": "移除零面积面并重新三角化",
+}
+
+ISSUE_GUIDANCE = {
+    "non_manifold": {
+        "zh": ("非流形几何", "一条边被三个或更多面共享", "会造成法线、切片、碰撞和导出结果不稳定", "分离相交壳体或合并重复组件，并重新检查共享边", "确认非流形边数量降为 0"),
+        "en": ("Non-manifold geometry", "An edge is shared by three or more faces", "It can destabilize normals, slicing, collisions, and export", "Separate intersecting shells or merge duplicate components, then recheck shared edges", "Confirm that the non-manifold edge count is 0"),
+    },
+    "uv_overlap": {
+        "zh": ("UV 重叠", "多个 UV 三角形覆盖了同一片 UV 空间", "会造成纹理串色、贴图覆盖和烘焙污染", "重新展开或打包 UV 岛，保留必要的镜像重叠并标记其用途", "确认 UV 重叠比例和重叠三角形数量符合项目阈值"),
+        "en": ("UV overlap", "Multiple UV triangles cover the same UV-space area", "It can cause texture bleeding, overrides, and bake contamination", "Unwrap or repack the UV islands; keep intentional mirrored overlaps documented", "Confirm that overlap ratio and overlapping-triangle count meet the project threshold"),
+    },
+    "flipped_normals": {
+        "zh": ("法线翻转", "相邻面的绕序方向不一致", "会导致局部黑面、背面剔除和光照方向错误", "统一面朝向并重新计算法线，再检查硬边和镜像修改器", "确认翻转面数量降为 0 且多视角无黑面"),
+        "en": ("Flipped normals", "Adjacent faces have inconsistent winding", "It can cause black patches, backface-culling errors, and incorrect lighting", "Recalculate and unify face orientation, then check hard edges and mirror modifiers", "Confirm that flipped-face count is 0 and no black patches remain in the views"),
+    },
+    "hole": {
+        "zh": ("模型孔洞", "存在没有被两个面闭合的边界边", "会破坏水密性，影响体积、碰撞、3D 打印和布尔运算", "填补边界环，合并重复顶点，并检查是否有意保留的开口", "确认边界边数量符合设计意图，封闭模型应为 0"),
+        "en": ("Mesh hole", "Boundary edges are not closed by two faces", "It can break watertightness and affect volume, collisions, printing, and booleans", "Fill boundary loops, merge duplicate vertices, and check whether any opening is intentional", "Confirm that boundary-edge count matches the design intent; watertight assets should be 0"),
+    },
+    "stretched_triangles": {
+        "zh": ("三角形拉伸", "三角形长宽比过高，局部拓扑分布不均", "会降低变形质量、法线稳定性和纹理分辨率利用率", "在拉伸区域增加合理边线并重新布线，避免细长三角形集中", "复检三角形长宽比 p95/max，并从多个视角观察变形和阴影"),
+        "en": ("Stretched triangles", "Some triangles have an unusually high aspect ratio", "It can reduce deformation quality, normal stability, and texture resolution efficiency", "Add supporting edges and retopologize the stretched region to avoid concentrated sliver triangles", "Recheck triangle aspect p95/max and inspect deformation and shading from multiple views"),
+    },
+    "degenerate_faces": {
+        "zh": ("退化面", "面面积接近 0，通常由重合或共线顶点造成", "会造成法线、UV、碰撞和后续重拓扑不稳定", "删除零面积面、合并重复顶点，并重新三角化或重拓扑", "确认退化面数量为 0，并复检法线、UV 和边界统计"),
+        "en": ("Degenerate faces", "A face has near-zero area, usually from coincident or collinear vertices", "It can destabilize normals, UVs, collisions, and retopology", "Delete zero-area faces, merge duplicate vertices, and retriangulate or retopologize", "Confirm that degenerate-face count is 0, then recheck normals, UVs, and boundaries"),
+    },
+}
 
 
 def _load_gradio():
@@ -72,35 +419,184 @@ def find_blender() -> str:
     return "blender"
 
 
-def prepare_uploaded_blend(file_path: str | None, blender_text: str) -> tuple[str, str, dict[str, Any], str, str, str, str]:
-    """Convert an uploaded .blend into the same runtime manifest used by samples."""
+def choose_adaptive_inspection_settings(source: Path, thresholds: dict[str, Any]) -> dict[str, Any]:
+    """Choose conservative preview settings for large uploads before Blender starts."""
+    size_bytes = source.stat().st_size if source.exists() else 0
+    size_mb = round(size_bytes / (1024 * 1024), 1)
+    original_views = int(thresholds.get("preview_views", 4))
+    original_resolution = int(thresholds.get("preview_resolution", 192))
+    original_diagnostic_limit = int(thresholds.get("max_diagnostic_triangles", 50_000))
+    if size_bytes >= 500 * 1024 * 1024:
+        strategy = "large_file_conservative"
+        views, resolution, diagnostic_limit = 1, 96, min(original_diagnostic_limit, 20_000)
+        reason_zh, reason_en = "文件超过 500 MB，优先保证规则检测完成。", "File exceeds 500 MB; prioritize completing rule inspection."
+    elif size_bytes >= 100 * 1024 * 1024:
+        strategy = "large_file_balanced"
+        views, resolution, diagnostic_limit = min(original_views, 2), min(original_resolution, 128), min(original_diagnostic_limit, 30_000)
+        reason_zh, reason_en = "文件超过 100 MB，降低预览成本并保留基础诊断图。", "File exceeds 100 MB; reduce preview cost while keeping basic diagnostics."
+    elif size_bytes >= 50 * 1024 * 1024:
+        strategy = "medium_file_balanced"
+        views, resolution, diagnostic_limit = min(original_views, 3), min(original_resolution, 160), min(original_diagnostic_limit, 40_000)
+        reason_zh, reason_en = "文件超过 50 MB，适度降低预览和诊断采样成本。", "File exceeds 50 MB; moderately reduce preview and diagnostic sampling cost."
+    else:
+        strategy = "default"
+        views, resolution, diagnostic_limit = original_views, original_resolution, original_diagnostic_limit
+        reason_zh, reason_en = "使用项目默认检测设置。", "Using the project default inspection settings."
+    return {
+        "strategy": strategy,
+        "source_file_size_bytes": size_bytes,
+        "source_file_size_mb": size_mb,
+        "original_preview_views": original_views,
+        "original_preview_resolution": original_resolution,
+        "original_max_diagnostic_triangles": original_diagnostic_limit,
+        "preview_views": max(1, min(8, views)),
+        "preview_resolution": max(64, resolution),
+        "max_diagnostic_triangles": max(1, diagnostic_limit),
+        "reason_zh": reason_zh,
+        "reason_en": reason_en,
+    }
+
+
+def write_runtime_inspection_metadata(manifest: Path, settings: dict[str, Any]) -> None:
+    """Persist the effective adaptive policy next to the generated manifest."""
+    if not manifest.exists():
+        return
+    rows = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines() if line.strip()]
+    for row in rows:
+        metadata = row.setdefault("metadata", {})
+        strategy_record = dict(settings)
+        if metadata.get("runtime_geometry_adaptive"):
+            strategy_record["geometry_adaptive"] = metadata["runtime_geometry_adaptive"]
+        metadata["runtime_inspection_strategy"] = strategy_record
+    manifest.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n", encoding="utf-8")
+
+
+def prepare_uploaded_asset(file_path: str | None, blender_text: str, threshold_text: str = str(DEFAULT_THRESHOLDS), progress: Any = _DEFAULT_PROGRESS) -> tuple[str, str, dict[str, Any], str, str, str, str, str, str, str]:
+    """Convert an uploaded 3D asset into the same runtime manifest used by samples."""
     if not file_path:
-        raise ValueError("Please choose a .blend file first.")
+        raise ValueError("Please choose a .blend, .fbx, or .obj file first.")
     source = Path(file_path)
-    if source.suffix.lower() != ".blend":
-        raise ValueError("Only .blend files are supported in Demo v1.")
+    if source.suffix.lower() not in {".blend", ".fbx", ".obj"}:
+        raise ValueError("Supported formats are .blend, .fbx, and .obj.")
     blender = blender_text.strip() or find_blender()
     if blender != "blender" and not Path(blender).exists():
         raise ValueError(f"Blender executable not found: {blender}")
+    threshold_path = resolve_threshold_path(threshold_text)
     job_dir = RUNTIME_DIR / f"job_{uuid.uuid4().hex[:10]}"
     job_dir.mkdir(parents=True, exist_ok=True)
     copied = job_dir / source.name
+    _progress_update(progress, 0.05, "上传阶段")
     shutil.copy2(source, copied)
-    command = [blender, "-b", "-P", str(ROOT / "blender" / "inspect_asset.py"), "--", "--input", str(copied), "--out", str(job_dir), "--views", "4", "--resolution", "256"]
-    completed = subprocess.run(command, cwd=str(ROOT), capture_output=True, text=True, timeout=180)
-    if completed.returncode != 0:
-        tail = (completed.stderr or completed.stdout)[-4000:]
-        raise RuntimeError(f"Blender preprocessing failed:\n{tail}")
+    thresholds = load_thresholds(threshold_path)
+    adaptive = choose_adaptive_inspection_settings(copied, thresholds)
+    runtime_threshold_path = job_dir / "inspection_thresholds.runtime.json"
+    runtime_thresholds = dict(thresholds)
+    runtime_thresholds.update({key: adaptive[key] for key in ("preview_views", "preview_resolution", "max_diagnostic_triangles")})
+    runtime_thresholds["runtime_inspection_strategy"] = adaptive["strategy"]
+    runtime_threshold_path.write_text(json.dumps(runtime_thresholds, ensure_ascii=False, indent=2), encoding="utf-8")
+    command = [blender, "-b", "-P", str(ROOT / "blender" / "inspect_asset.py"), "--", "--input", str(copied), "--out", str(job_dir), "--views", str(adaptive["preview_views"]), "--resolution", str(adaptive["preview_resolution"]), "--config", str(runtime_threshold_path)]
+    log_path = run_blender_job(command, job_dir, progress, timeout=int(thresholds["job_timeout_seconds"]))
     manifest = job_dir / "manifest.jsonl"
     if not manifest.exists():
         raise RuntimeError("Blender finished without producing a runtime manifest.")
+    write_runtime_inspection_metadata(manifest, adaptive)
     rows, indexed = load_rows(manifest)
     row = rows[0]
     paths = resolve_image_paths(row, manifest)
-    info = {"source_file": source.name, "runtime_job": str(job_dir), "metadata": compact_metadata(row["metadata"])}
+    info = {"source_file": source.name, "runtime_job": str(job_dir), "log_file": str(log_path), "adaptive_inspection": adaptive, "metadata": compact_metadata(row["metadata"])}
     gr = _load_gradio()
     sample_update = gr.Dropdown(choices=[row["id"]], value=row["id"], label="Test asset")
-    return str(manifest), sample_update, info, paths["views"], paths["uv"] or "", paths["normal"] or "", f"Prepared successfully: {source.name}"
+    return str(manifest), sample_update, info, paths["views"], paths["uv"] or None, paths["uv_heatmap"] or None, paths["normal"] or None, paths["model"] or None, paths["model_overlay"] or None, f"Prepared successfully: {source.name} | strategy: {adaptive['strategy']} ({adaptive['preview_views']} views / {adaptive['preview_resolution']}px) | log: {log_path}"
+
+
+def repair_and_reinspect(manifest_text: str, blender_text: str, threshold_text: str = str(DEFAULT_THRESHOLDS), progress: Any = _DEFAULT_PROGRESS) -> tuple[str, str, dict[str, Any], str, str, str, str, str, str, str]:
+    """Safely repair a runtime copy, then run the full inspection pipeline again."""
+    if not manifest_text:
+        raise ValueError("Prepare or upload an asset before requesting repair.")
+    manifest = Path(manifest_text).expanduser().resolve()
+    if not manifest.exists():
+        raise ValueError(f"Runtime manifest not found: {manifest}")
+    source_candidates = sorted(
+        (path for path in manifest.parent.iterdir() if path.suffix.lower() in {".blend", ".fbx", ".obj"}),
+        key=lambda path: path.name.lower(),
+    )
+    if not source_candidates:
+        raise ValueError("The runtime job no longer contains the original .blend/.fbx/.obj copy.")
+    source = source_candidates[0]
+    blender = blender_text.strip() or find_blender()
+    if blender != "blender" and not Path(blender).exists():
+        raise ValueError(f"Blender executable not found: {blender}")
+    threshold_path = resolve_threshold_path(threshold_text)
+    thresholds = load_thresholds(threshold_path)
+    job_dir = RUNTIME_DIR / f"repair_{uuid.uuid4().hex[:10]}"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    repaired_output = job_dir / "repaired_asset.blend"
+    adaptive = choose_adaptive_inspection_settings(source, thresholds)
+    runtime_threshold_path = job_dir / "inspection_thresholds.runtime.json"
+    runtime_thresholds = dict(thresholds)
+    runtime_thresholds.update({key: adaptive[key] for key in ("preview_views", "preview_resolution", "max_diagnostic_triangles")})
+    runtime_thresholds["runtime_inspection_strategy"] = adaptive["strategy"]
+    runtime_threshold_path.write_text(json.dumps(runtime_thresholds, ensure_ascii=False, indent=2), encoding="utf-8")
+    command = [
+        blender, "-b", "-P", str(ROOT / "blender" / "inspect_asset.py"), "--",
+        "--input", str(source), "--out", str(job_dir), "--views", str(adaptive["preview_views"]), "--resolution", str(adaptive["preview_resolution"]),
+        "--repair", "--repaired-output", str(repaired_output), "--config", str(runtime_threshold_path),
+    ]
+    log_path = run_blender_job(command, job_dir, progress, timeout=max(300, int(thresholds["job_timeout_seconds"])))
+    repaired_manifest = job_dir / "manifest.jsonl"
+    if not repaired_manifest.exists():
+        raise RuntimeError("Repair completed without producing a new runtime manifest.")
+    write_runtime_inspection_metadata(repaired_manifest, adaptive)
+    rows, _ = load_rows(repaired_manifest)
+    row = rows[0]
+    paths = resolve_image_paths(row, repaired_manifest)
+    info = {
+        "source_file": source.name,
+        "runtime_job": str(job_dir),
+        "repaired_output": str(repaired_output),
+        "log_file": str(log_path),
+        "repair_applied": True,
+        "adaptive_inspection": adaptive,
+        "metadata": compact_metadata(row["metadata"]),
+    }
+    gr = _load_gradio()
+    sample_update = gr.Dropdown(choices=[row["id"]], value=row["id"], label="Test asset")
+    return str(repaired_manifest), sample_update, info, paths["views"], paths["uv"] or None, paths["uv_heatmap"] or None, paths["normal"] or None, paths["model"] or None, paths["model_overlay"] or None, f"Repaired a runtime copy and re-inspected: {source.name} | strategy: {adaptive['strategy']} ({adaptive['preview_views']} views / {adaptive['preview_resolution']}px) | log: {log_path}"
+
+
+def generate_demo_asset(blender_text: str, threshold_text: str, asset_family: str, defect: str, progress: Any = _DEFAULT_PROGRESS) -> tuple[str, str, dict[str, Any], str, str, str, str, str, str, str]:
+    """Generate a controlled local fixture and put it through the upload path."""
+    blender = blender_text.strip() or find_blender()
+    if blender != "blender" and not Path(blender).exists():
+        raise ValueError(f"Blender executable not found: {blender}")
+    generation_dir = RUNTIME_DIR / f"generation_{uuid.uuid4().hex[:10]}"
+    generation_dir.mkdir(parents=True, exist_ok=True)
+    output = generation_dir / f"generated_{asset_family}_{defect}.blend"
+    threshold_path = resolve_threshold_path(threshold_text)
+    command = [
+        blender,
+        "-b",
+        "-P",
+        str(ROOT / "blender" / "create_demo_blend.py"),
+        "--",
+        "--out",
+        str(output),
+        "--family",
+        asset_family,
+        "--defect",
+        defect,
+    ]
+    _progress_update(progress, 0.05, "生成测试资产阶段")
+    generation_log = run_blender_job(command, generation_dir, progress, timeout=180)
+    if not output.exists():
+        raise RuntimeError(f"Demo asset generation finished without producing: {output}. Log: {generation_log}")
+    prepared = prepare_uploaded_asset(str(output), blender, str(threshold_path), progress)
+    info = dict(prepared[2])
+    info["generated_family"] = asset_family
+    info["requested_defect"] = defect
+    info["generated_file"] = str(output)
+    info["generation_log_file"] = str(generation_log)
+    return prepared[0], prepared[1], info, prepared[3], prepared[4], prepared[5], prepared[6], prepared[7], prepared[8], f"Generated and prepared: {asset_family} / {defect} | logs: {generation_log}, {info['log_file']}"
 
 
 def resolve_image_paths(row: dict[str, Any], manifest: Path) -> dict[str, Any]:
@@ -108,34 +604,920 @@ def resolve_image_paths(row: dict[str, Any], manifest: Path) -> dict[str, Any]:
     images = row.get("images", {})
     views = [str((root / item).resolve()) for item in images.get("views", [])]
     uv = str((root / images["uv"]).resolve()) if images.get("uv") else None
+    uv_heatmap = str((root / images["uv_heatmap"]).resolve()) if images.get("uv_heatmap") else None
     normal = str((root / images["normal"]).resolve()) if images.get("normal") else None
-    return {"views": views, "uv": uv, "normal": normal}
+    model = str((root / images["model"]).resolve()) if images.get("model") else None
+    model_overlay = str((root / images["model_overlay"]).resolve()) if images.get("model_overlay") else None
+    return {"views": views, "uv": uv, "uv_heatmap": uv_heatmap, "normal": normal, "model": model, "model_overlay": model_overlay}
 
 
-def run_rule(row: dict[str, Any]) -> dict[str, Any]:
+def run_rule(
+    row: dict[str, Any],
+    target_face_budget: str = "Auto",
+    reference_image_provided: bool = False,
+    prompt_provided: bool = False,
+    soft_model_used: bool = False,
+    thresholds: dict[str, Any] | None = None,
+    asset_profile: str = "Auto",
+) -> dict[str, Any]:
     metadata = row.get("metadata", {})
+    thresholds = thresholds or load_thresholds()
+    resolved_profile = resolve_asset_profile(asset_profile, metadata, target_face_budget)
     started = time.perf_counter()
-    defects = infer_defects(metadata, uv_threshold=0.001, stretch_ratio=4.0)
+    defects = infer_defects(
+        metadata,
+        uv_threshold=float(thresholds["max_uv_overlap_ratio"]),
+        stretch_ratio=float(thresholds["max_triangle_aspect_p95"]),
+        boundary_policy=boundary_policy_for_profile(resolved_profile),
+    )
+    uv_analyzed = int(metadata.get("uv_analysis_analyzed_triangle_count", 0) or 0)
+    uv_valid = int(metadata.get("uv_valid_triangle_count", 0) or 0)
+    uv_invalid = bool(
+        "uv_valid_triangle_count" in metadata
+        and metadata.get("uv_status") == "present"
+        and uv_analyzed > 0
+        and uv_valid / uv_analyzed < 0.99
+    )
     prediction: dict[str, Any] = {
-        "quality": "pass" if not defects else "fail",
+        "quality": "pass" if not defects and not uv_invalid else "fail",
         "defect_types": defects,
-        "severity": infer_severity(defects),
+        "severity": "high" if uv_invalid else infer_severity(defects),
+        "asset_profile": resolved_profile,
     }
-    if row.get("question_type") == "repair_planning":
-        repair = {
-            "non_manifold": "merge or separate non-manifold components",
-            "uv_overlap": "repack overlapping UV islands",
-            "flipped_normals": "recalculate and validate face normals",
-            "hole": "fill boundary loops and inspect watertightness",
-            "stretched_triangles": "rebuild stretched regions with better topology",
-            "degenerate_faces": "remove zero-area faces and re-triangulate",
-        }
-        prediction["repair_plan"] = [repair[name] for name in defects] or ["no repair required"]
+    repair = {
+        "non_manifold": "merge or separate non-manifold components",
+        "uv_overlap": "repack overlapping UV islands",
+        "flipped_normals": "recalculate and validate face normals",
+        "hole": "fill boundary loops and inspect watertightness",
+        "stretched_triangles": "rebuild stretched regions with better topology",
+        "degenerate_faces": "remove zero-area faces and re-triangulate",
+    }
+    # Runtime/generated assets use ``quality_summary`` rather than the
+    # benchmark's repair-planning question, but the web demo should still
+    # provide actionable feedback to the operator.
+    prediction["repair_plan"] = [repair[name] for name in defects]
+    if uv_invalid:
+        prediction["repair_plan"].append("re-unwrap UVs and confirm non-zero UV triangle areas")
+    if not prediction["repair_plan"]:
+        prediction["repair_plan"] = ["no repair required"]
+    prediction["issue_details"] = build_issue_details(metadata, defects)
+    prediction["warnings"] = build_complex_warnings(metadata, resolved_profile)
+    prediction["inspection_sections"] = build_inspection_sections(metadata, defects)
+    prediction["asset_readiness"] = build_asset_readiness(metadata)
+    prediction["confidence_report"] = build_confidence_report(metadata, defects, target_face_budget, thresholds)
+    prediction["inspection_coverage"] = build_inspection_coverage(metadata)
+    prediction["inspection_coverage_details"] = build_inspection_coverage_details(metadata)
+    prediction["issues"] = build_unified_issues(metadata, prediction, target_face_budget, thresholds)
+    prediction["health_score"] = compute_health_score(
+        metadata,
+        defects,
+        target_face_budget,
+        reference_image_provided,
+        prompt_provided,
+        soft_model_used,
+        int(thresholds["max_faces"]),
+        asset_profile=resolved_profile,
+    )
+    prediction["issues"] = prioritize_issue_cards(prediction["issues"], prediction["health_score"])
     return {
         "prediction": prediction,
         "latency_ms": round((time.perf_counter() - started) * 1000, 2),
         "model": "deterministic_rule_baseline",
         "schema_valid": True,
+    }
+
+
+def build_confidence_report(metadata: dict[str, Any], defects: list[str], target_face_budget: str, thresholds: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Explain deterministic confidence, current value, threshold, and proximity."""
+    thresholds = thresholds or load_thresholds()
+    checks = []
+
+    def add(metric, current, threshold, unit="", failed=False, note_zh="", note_en=""):
+        numeric_current = float(current or 0)
+        numeric_threshold = float(threshold)
+        if failed:
+            status = "fail"
+        elif numeric_threshold == 0:
+            status = "pass" if numeric_current == 0 else "fail"
+        else:
+            ratio = numeric_current / numeric_threshold
+            # Keep a clear distinction between a value that is close to a
+            # limit and one that actually exceeds it.  The old 0.75 band was
+            # too wide and made ordinary values look suspicious.
+            status = "near_threshold" if 0.9 <= ratio <= 1.0 else "pass"
+        checks.append({
+            "metric": metric,
+            "current": round(numeric_current, 6),
+            "threshold": round(numeric_threshold, 6),
+            "unit": unit,
+            "status": status,
+            "confidence": "medium" if status == "near_threshold" else "high",
+            "note_zh": note_zh,
+            "note_en": note_en,
+        })
+
+    uv_overlap = metadata.get("uv_overlap_ratio", 0.0)
+    uv_overlap_count = int(metadata.get("uv_overlap_triangle_count", 0) or 0)
+    uv_overlap_threshold = float(thresholds["max_uv_overlap_ratio"])
+    add("uv_overlap_ratio", uv_overlap, uv_overlap_threshold, "ratio", uv_overlap > uv_overlap_threshold or uv_overlap_count > 0,
+        "UV 重叠比例超过规则阈值，或检测到明确的重叠三角形。", "The UV overlap ratio exceeded the rule threshold, or overlapping triangles were directly detected.")
+    aspect = metadata.get("triangle_aspect_stats", {}).get("p95", 0.0)
+    aspect_threshold = float(thresholds["max_triangle_aspect_p95"])
+    add("triangle_aspect_p95", aspect, aspect_threshold, "ratio", aspect > aspect_threshold,
+        "三角形长宽比接近或超过规则阈值。", "Triangle aspect ratio is close to or above the rule threshold.")
+    uv_total = int(metadata.get("uv_analysis_analyzed_triangle_count", 0) or 0)
+    uv_valid = int(metadata.get("uv_valid_triangle_count", 0) or 0)
+    if "uv_valid_triangle_count" in metadata and metadata.get("uv_status") == "present" and uv_total > 0:
+        uv_valid_ratio = uv_valid / uv_total
+        add(
+            "uv_valid_triangle_ratio",
+            uv_valid_ratio,
+            0.99,
+            "ratio",
+            uv_valid_ratio < 0.99,
+            "有效 UV 三角形比例低于 99%，无法可靠绘制或用于纹理制作。" if uv_valid_ratio < 0.99 else "有效 UV 三角形比例达到 99% 以上。",
+            "Fewer than 99% of analyzed UV triangles have usable area." if uv_valid_ratio < 0.99 else "At least 99% of analyzed UV triangles have usable area.",
+        )
+    if target_face_budget != "Auto":
+        budgets = {"50k": 50_000, "1m": 1_000_000, "1.5m": 1_500_000}
+        face_count = metadata.get("triangle_count", metadata.get("face_count", 0))
+        budget = budgets[target_face_budget]
+        add("triangle_count", face_count, budget, "triangles", face_count > budget,
+            "面数接近或超过所选预算。", "Triangle count is close to or above the selected budget.")
+    else:
+        face_count = metadata.get("triangle_count", metadata.get("face_count", 0))
+        max_faces = int(thresholds["max_faces"])
+        add("triangle_count", face_count, max_faces, "triangles", face_count > max_faces,
+            "面数接近或超过配置文件中的默认预算。", "Triangle count is close to or above the configured default budget.")
+    pbr_issues = metadata.get("pbr_channel_issue_count", 0)
+    add("pbr_channel_issue_count", pbr_issues, 0, "issues", pbr_issues > 0,
+        "PBR 通道、颜色空间或节点结构存在可验证问题。", "Verifiable PBR wiring, color-space, or node-structure issues were found.")
+    return {
+        "method": "deterministic_rules",
+        "overall_confidence": "medium" if any(item["confidence"] == "medium" for item in checks) else "high",
+        "checks": checks,
+        "explanation_zh": "规则检测是确定性的；当当前值接近阈值时，结果标为中等置信度并建议人工复核。",
+        "explanation_en": "The rule checks are deterministic; values close to a threshold are marked medium confidence and should be reviewed.",
+    }
+
+
+def build_inspection_coverage(metadata: dict[str, Any]) -> dict[str, str]:
+    """Make checked, not-checked, and sampled states explicit in every result."""
+    uv_available = int(metadata.get("uv_layer_count", metadata.get("source_uv_layer_count", 0)) or 0) > 0 and metadata.get("uv_status", "present") != "not_present"
+    uv_sampled = bool(metadata.get("uv_analysis_sampled") or metadata.get("uv_overlap_analysis_sampled"))
+    if uv_sampled:
+        analyzed = int(metadata.get("uv_overlap_analyzed_triangle_count", metadata.get("uv_analysis_triangle_limit", 0)) or 0)
+        total = int(metadata.get("triangle_count", metadata.get("face_count", 0)) or 0)
+        ratio = round(100 * analyzed / total, 1) if total else 0.0
+        uv_state = f"sampled:{analyzed}/{total} ({ratio}%)"
+    else:
+        uv_state = "checked" if uv_available else "not_checked"
+    return {
+        "geometry": "checked" if metadata.get("vertex_count") and metadata.get("face_count") else "not_checked",
+        "uv": uv_state,
+        "materials": "checked" if "texture_image_count" in metadata else "not_checked",
+        "animation": "not_applicable" if not metadata.get("source_has_armature") and not metadata.get("source_has_animation") else "checked",
+    }
+
+
+def build_inspection_coverage_details(metadata: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return measurable coverage evidence without collapsing it into a pass/fail label."""
+    uv_available = int(metadata.get("uv_layer_count", metadata.get("source_uv_layer_count", 0)) or 0) > 0 and metadata.get("uv_status", "present") != "not_present"
+    uv_sampled = bool(metadata.get("uv_analysis_sampled") or metadata.get("uv_overlap_analysis_sampled"))
+    analyzed = int(metadata.get("uv_analysis_analyzed_triangle_count", metadata.get("uv_overlap_analyzed_triangle_count", 0)) or 0)
+    total = int(metadata.get("uv_analysis_total_triangle_count", metadata.get("triangle_count", metadata.get("face_count", 0))) or 0)
+    uv_ratio = round(analyzed / total, 4) if total else 0.0
+    valid_uv_triangles = int(metadata.get("uv_valid_triangle_count", 0) or 0)
+    valid_uv_ratio = round(valid_uv_triangles / analyzed, 4) if analyzed else None
+    if uv_sampled:
+        uv_status = "sampled"
+        uv_note_zh = "UV 只分析了部分三角形，结论应视为采样估计。"
+        uv_note_en = "Only part of the UV triangles was analyzed; treat the result as a sampled estimate."
+    elif not uv_available and metadata.get("texture_image_count", 0):
+        uv_status = "not_checked"
+        uv_note_zh = "检测到贴图或贴图相关数据，但没有可用 UV 层，无法验证纹理布局。"
+        uv_note_en = "Texture-related data exists, but no usable UV layer was available to validate the layout."
+    elif not uv_available:
+        uv_status = "not_applicable"
+        uv_note_zh = "资产没有 UV，且当前没有贴图布局需要验证。"
+        uv_note_en = "The asset has no UVs and no texture layout to validate in the current inspection."
+    else:
+        uv_status = "checked"
+        if analyzed and valid_uv_triangles < analyzed:
+            uv_note_zh = f"已分析 {analyzed} 个 UV 三角形，其中 {valid_uv_triangles} 个具有可用面积；无效 UV 不应被误认为布局通过。"
+            uv_note_en = f"Analyzed {analyzed} UV triangles; {valid_uv_triangles} had usable area. Invalid UVs should not be interpreted as a passing layout."
+        else:
+            uv_note_zh = "已分析全部可用 UV 三角形。"
+            uv_note_en = "All available UV triangles were analyzed."
+    animation_present = bool(metadata.get("source_has_armature") or metadata.get("source_has_animation"))
+    return {
+        "geometry": {
+            "status": "checked" if metadata.get("vertex_count") and metadata.get("face_count") else "not_checked",
+            "observed": f"objects={metadata.get('source_mesh_object_count', '—')}, vertices={metadata.get('vertex_count', '—')}, faces={metadata.get('face_count', '—')}",
+            "coverage_ratio": 1.0 if metadata.get("vertex_count") and metadata.get("face_count") else 0.0,
+            "note_zh": "已统计导入后的网格对象、顶点和面。" if metadata.get("vertex_count") and metadata.get("face_count") else "没有足够的几何统计数据。",
+            "note_en": "Imported mesh objects, vertices, and faces were counted." if metadata.get("vertex_count") and metadata.get("face_count") else "Insufficient geometry statistics were available.",
+        },
+        "uv": {
+            "status": uv_status,
+            "observed": f"analyzed={analyzed}, total={total}, coverage={round(uv_ratio * 100, 1)}%, valid={round((valid_uv_ratio or 0.0) * 100, 1)}%",
+            "coverage_ratio": uv_ratio,
+            "valid_triangle_ratio": valid_uv_ratio,
+            "note_zh": uv_note_zh,
+            "note_en": uv_note_en,
+        },
+        "materials": {
+            "status": "checked" if "texture_image_count" in metadata else "not_checked",
+            "observed": f"materials={metadata.get('material_count', '—')}, images={metadata.get('texture_image_count', '—')}, PBR issues={metadata.get('pbr_channel_issue_count', '—')}",
+            "coverage_ratio": 1.0 if "texture_image_count" in metadata else 0.0,
+            "note_zh": "已检查材质、图片贴图和 PBR 通道统计。" if "texture_image_count" in metadata else "没有材质检测统计。",
+            "note_en": "Materials, image textures, and PBR channel statistics were checked." if "texture_image_count" in metadata else "No material inspection statistics were available.",
+        },
+        "animation": {
+            "status": "checked" if animation_present else "not_applicable",
+            "observed": f"armatures={metadata.get('source_armature_count', 0)}, actions={metadata.get('animation_action_count', 0)}, rigged_meshes={metadata.get('rigged_mesh_count', 0)}",
+            "coverage_ratio": 1.0 if animation_present else None,
+            "note_zh": "资产包含骨骼或动画，已执行动画/蒙皮检查。" if animation_present else "资产没有骨骼或动画，因此该项不适用。",
+            "note_en": "The asset contains armatures or animation and was checked for animation/skinning." if animation_present else "The asset has no armature or animation, so this check is not applicable.",
+        },
+    }
+
+
+def build_unified_issues(metadata: dict[str, Any], prediction: dict[str, Any], target_face_budget: str, thresholds: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build the canonical issue protocol consumed by UI, HTML, and JSON outputs."""
+    defects = prediction.get("defect_types", []) if isinstance(prediction.get("defect_types"), list) else []
+    details = build_issue_details(metadata, defects)
+    warnings = build_complex_warnings(metadata, prediction.get("asset_profile", "Auto"))
+    confidence = build_confidence_report(metadata, defects, target_face_budget, thresholds)
+    checks = {item.get("metric"): item for item in confidence.get("checks", [])}
+    locator_map = {
+        "uv_overlap": {"asset": "uv_heatmap", "label_zh": "UV 拉伸 / 密度热力图", "label_en": "UV stretch / density heatmap"},
+        "flipped_normals": {"asset": "normal", "label_zh": "法线诊断图", "label_en": "Normal diagnostic"},
+        "hole": {"asset": "model", "label_zh": "3D 预览中的网格边界", "label_en": "Mesh boundary in 3D preview"},
+        "non_manifold": {"asset": "model", "label_zh": "3D 预览中的非流形区域", "label_en": "Non-manifold region in 3D preview"},
+        "degenerate_faces": {"asset": "model", "label_zh": "3D 预览中的退化几何", "label_en": "Degenerate geometry in 3D preview"},
+        "stretched_triangles": {"asset": "model", "label_zh": "3D 预览中的拉伸拓扑", "label_en": "Stretched topology in 3D preview"},
+    }
+    blocking_types = {"hole", "non_manifold", "degenerate_faces", "uv_overlap"}
+    threshold_map = {"uv_overlap": "uv_overlap_ratio", "stretched_triangles": "triangle_aspect_p95"}
+    coverage = build_inspection_coverage(metadata)
+    related_face_counts = metadata.get("issue_related_face_counts", {})
+    source_issue_breakdown = metadata.get("source_issue_breakdown", []) or []
+
+    def issue_locator(defect: str, fallback: dict[str, str]) -> dict[str, Any]:
+        location = dict(locator_map.get(defect, fallback))
+        if defect in {"hole", "non_manifold", "degenerate_faces", "flipped_normals", "stretched_triangles", "uv_overlap"}:
+            location["related_face_count"] = int(related_face_counts.get(defect, 0) or 0)
+            object_rows = [
+                item for item in source_issue_breakdown
+                if int((item.get("related_face_counts", {}) or {}).get(defect, 0) or 0) > 0
+            ]
+            object_rows.sort(key=lambda item: int((item.get("related_face_counts", {}) or {}).get(defect, 0) or 0), reverse=True)
+            location["object_names"] = [str(item.get("object_name", "—")) for item in object_rows[:8]]
+            location["object_count"] = len(object_rows)
+        return location
+
+    issues: list[dict[str, Any]] = []
+    for detail in details:
+        defect = detail.get("defect_type")
+        check = checks.get(threshold_map.get(defect))
+        check_status = check.get("status") if check else None
+        # VLM may call out a visual concern even when the measured value is
+        # still below the configured threshold. Keep that as a review note,
+        # not a hard failure. This prevents a 7.9/8.0 measurement from being
+        # reported as "failed" merely because a soft model mentioned it.
+        soft_near = defect == "stretched_triangles" and check_status != "fail"
+        issue_status = ("near_threshold" if check_status == "near_threshold" else "attention") if soft_near else "fail"
+        issue_blocking = defect in blocking_types and issue_status == "fail"
+        issue_severity = "low" if soft_near else detail.get("severity", "medium")
+        issue_evidence = detail.get("evidence", "")
+        if soft_near:
+            issue_evidence += "；视觉模型提示，但硬指标尚未超过配置阈值。"
+        issues.append({
+            "issue_id": f"defect:{defect}",
+            "title_zh": detail.get("title_zh", defect),
+            "title_en": detail.get("title_en", defect),
+            "severity": issue_severity,
+            "blocking": issue_blocking,
+            "status": issue_status,
+            "current_value": check.get("current") if check else None,
+            "threshold": check.get("threshold") if check else None,
+            "unit": check.get("unit", "") if check else "",
+            "confidence": check.get("confidence", "high") if check else "high",
+            "evidence": issue_evidence,
+            "impact_zh": detail.get("impact_zh", ""),
+            "impact_en": detail.get("impact_en", ""),
+            "fix_zh": detail.get("repair_zh", ""),
+            "fix_en": detail.get("repair_en", ""),
+            "recheck_zh": detail.get("recheck_zh", ""),
+            "recheck_en": detail.get("recheck_en", ""),
+            "locator": issue_locator(defect, {"asset": "model", "label_zh": "3D 预览", "label_en": "3D preview"}),
+            "coverage": coverage.get("uv" if defect == "uv_overlap" else "geometry", "checked"),
+        })
+    for warning in warnings:
+        code = warning.get("code", "warning")
+        check = checks.get("pbr_channel_issue_count") if code == "pbr_channel_wiring" else None
+        warning_title_zh = {
+            "pbr_channel_wiring": "PBR 材质通道",
+            "missing_external_textures": "外部贴图路径缺失",
+            "textureless_materials": "纯色 / 程序化材质",
+            "open_boundary_edges": "开放边界（按档案允许）",
+            "material_slot_overflow": "材质槽过多",
+            "missing_uv": "源文件缺少 UV",
+            "unassigned_material_slots": "空材质槽",
+            "transform_anomaly": "变换异常",
+            "non_default_scene_units": "场景单位缩放",
+            "lod_sequence_gap": "LOD 序列缺级",
+            "loading_performance": "加载性能风险",
+            "animation_skinning": "动画 / 蒙皮",
+        }.get(code, warning.get("message_zh", code))
+        warning_title_en = {
+            "pbr_channel_wiring": "PBR material wiring",
+            "missing_external_textures": "Missing external textures",
+            "textureless_materials": "Constant / procedural materials",
+            "open_boundary_edges": "Open boundaries allowed by profile",
+            "material_slot_overflow": "Material-slot overflow",
+            "missing_uv": "Missing source UV",
+            "unassigned_material_slots": "Unassigned material slots",
+            "transform_anomaly": "Transform anomaly",
+            "non_default_scene_units": "Non-default scene units",
+            "lod_sequence_gap": "LOD sequence gap",
+            "loading_performance": "Loading performance risk",
+            "animation_skinning": "Animation / skinning",
+        }.get(code, warning.get("message_en", code))
+        issues.append({
+            "issue_id": f"warning:{code}",
+            "title_zh": warning_title_zh,
+            "title_en": warning_title_en,
+            "severity": "medium" if warning.get("level") == "warning" else "low",
+            "blocking": False,
+            "status": "attention" if warning.get("level") == "warning" else "info",
+            "current_value": check.get("current") if check else None,
+            "threshold": check.get("threshold") if check else None,
+            "unit": check.get("unit", "") if check else "",
+            "confidence": check.get("confidence", "high") if check else "high",
+            "evidence": warning.get("evidence", ""),
+            "material_details": warning.get("material_details", []),
+            "impact_zh": warning.get("message_zh", ""),
+            "impact_en": warning.get("message_en", ""),
+            "fix_zh": warning.get("suggestion_zh", ""),
+            "fix_en": warning.get("suggestion_en", ""),
+            "recheck_zh": "复检对应结构指标并确认符合目标平台要求。",
+            "recheck_en": "Recheck the structural metric against the target-platform requirement.",
+            "locator": {"asset": "asset_info", "label_zh": "资产信息 / 材质统计", "label_en": "Asset information / material statistics"},
+            "coverage": coverage.get("materials" if code == "pbr_channel_wiring" else "geometry", "checked"),
+        })
+    linked_metrics = {threshold_map.get(detail.get("defect_type")) for detail in details}
+    for check in confidence.get("checks", []):
+        if check.get("status") not in {"fail", "near_threshold"} or check.get("metric") in linked_metrics or check.get("metric") == "pbr_channel_issue_count":
+            continue
+        metric = check.get("metric")
+        is_uv_validity = metric == "uv_valid_triangle_ratio"
+        is_face_budget = metric == "triangle_count"
+        if metric == "triangle_aspect_p95":
+            title_zh, title_en = "三角形拉伸", "Triangle aspect"
+            impact_zh = "三角形长宽比接近阈值，建议在目标视角下复核拓扑和阴影。"
+            impact_en = "Triangle aspect is close to the threshold; review topology and shading in target views."
+            fix_zh = "检查细长三角形集中区域，必要时重新布线。"
+            fix_en = "Inspect concentrated sliver triangles and retopologize if needed."
+        elif is_uv_validity:
+            title_zh, title_en = "UV 有效性", "UV validity"
+            impact_zh = "有效 UV 三角形比例过低，当前 UV 图和热力图不能代表可用的纹理布局。"
+            impact_en = "Too few UV triangles have usable area; the current UV layout and heatmap are not reliable for texturing."
+            fix_zh = "重新展开 UV，并确认三角形具有非零 UV 面积。"
+            fix_en = "Re-unwrap the asset and confirm that UV triangles have non-zero area."
+        else:
+            title_zh = "面数预算" if is_face_budget else "接近阈值"
+            title_en = "Face budget" if is_face_budget else "Threshold proximity"
+            impact_zh = "可能超过目标平台的面数预算。" if is_face_budget else "当前值接近配置阈值，需要结合目标用途复核。"
+            impact_en = "The asset may exceed the target-platform face budget." if is_face_budget else "The value is close to the configured threshold and should be reviewed for the target use."
+            fix_zh = "按目标档位生成 LOD 或降低面数。" if is_face_budget else "结合目标平台和资产类型确认是否需要调整。"
+            fix_en = "Generate an appropriate LOD or reduce the triangle count." if is_face_budget else "Confirm the requirement against the target platform and asset type."
+        check_status = check.get("status")
+        check_blocking = (is_face_budget or is_uv_validity) and check_status == "fail"
+        issues.append({
+            "issue_id": f"threshold:{check.get('metric')}",
+            "title_zh": title_zh,
+            "title_en": title_en,
+            "severity": "high" if check_blocking else "low",
+            "blocking": check_blocking,
+            "status": check_status,
+            "current_value": check.get("current"), "threshold": check.get("threshold"), "unit": check.get("unit", ""),
+            "confidence": check.get("confidence", "high"), "evidence": check.get("note_zh", ""),
+            "impact_zh": impact_zh, "impact_en": impact_en,
+            "fix_zh": fix_zh, "fix_en": fix_en,
+            "recheck_zh": "确认有效 UV 三角形比例达到 99% 以上。" if is_uv_validity else ("确认三角形数量低于配置阈值。" if is_face_budget else "复检当前值是否仍接近阈值。"),
+            "recheck_en": "Confirm that at least 99% of UV triangles have usable area." if is_uv_validity else ("Confirm that triangle count is below the configured threshold." if is_face_budget else "Recheck whether the value remains close to the threshold."),
+            "locator": {"asset": "uv" if is_uv_validity else "model", "label_zh": "UV 诊断图" if is_uv_validity else ("3D 预览 / 面数统计" if is_face_budget else "3D 预览 / 拓扑统计"), "label_en": "UV diagnostic" if is_uv_validity else ("3D preview / face-count statistics" if is_face_budget else "3D preview / topology statistics")},
+            "coverage": coverage.get("uv" if is_uv_validity else "geometry", "checked"),
+        })
+    return issues
+
+
+def prioritize_issue_cards(issues: list[dict[str, Any]], health: dict[str, Any]) -> list[dict[str, Any]]:
+    """Order cards by release blocking first, then by the selected profile's risk."""
+    risk_by_component = {
+        item.get("component"): item
+        for item in health.get("profile_fit_risk_items", [])
+        if item.get("component")
+    }
+    component_by_code = {
+        "hole": "geometry_and_defects",
+        "non_manifold": "geometry_and_defects",
+        "degenerate_faces": "geometry_and_defects",
+        "flipped_normals": "geometry_and_defects",
+        "stretched_triangles": "geometry_and_defects",
+        "triangle_count": "geometry_and_defects",
+        "open_boundary_edges": "geometry_and_defects",
+        "transform_anomaly": "geometry_and_defects",
+        "non_default_scene_units": "geometry_and_defects",
+        "component_breakdown": "geometry_and_defects",
+        "multiple_mesh_objects": "geometry_and_defects",
+        "loose_vertices": "geometry_and_defects",
+        "zero_length_edges": "geometry_and_defects",
+        "detached_components": "geometry_and_defects",
+        "ngons": "geometry_and_defects",
+        "uv_overlap": "uv",
+        "uv_validity": "uv",
+        "missing_uv": "uv",
+        "pbr_channel_wiring": "materials",
+        "missing_external_textures": "materials",
+        "textureless_materials": "materials",
+        "material_slot_overflow": "materials",
+        "unassigned_material_slots": "materials",
+        "loading_performance": "runtime",
+        "animation_skinning": "animation",
+        "rig_or_animation_present": "animation",
+    }
+    severity_rank = {"high": 3, "medium": 2, "low": 1, "info": 0}
+    status_rank = {"fail": 3, "attention": 2, "near_threshold": 1, "info": 0}
+    ordered: list[tuple[tuple[float, ...], dict[str, Any]]] = []
+    for index, issue in enumerate(issues):
+        issue_copy = dict(issue)
+        issue_id = str(issue_copy.get("issue_id", ""))
+        code = issue_id.split(":", 1)[1] if ":" in issue_id else issue_id
+        component = component_by_code.get(code)
+        risk = risk_by_component.get(component, {}) if component else {}
+        issue_copy["profile_component"] = component
+        issue_copy["profile_priority"] = risk.get("priority_score", 0.0)
+        issue_copy["profile_priority_quality_gap"] = risk.get("quality_gap", 0.0)
+        issue_copy["profile_priority_coverage_uncertainty"] = risk.get("coverage_uncertainty", 0.0)
+        issue_copy["profile_priority_status"] = risk.get("status", "not_available")
+        sort_key = (
+            1.0 if issue_copy.get("blocking") else 0.0,
+            float(status_rank.get(issue_copy.get("status"), 0)),
+            float(issue_copy.get("profile_priority", 0.0)),
+            float(severity_rank.get(issue_copy.get("severity"), 0)),
+            -float(index),
+        )
+        ordered.append((sort_key, issue_copy))
+    ordered.sort(key=lambda item: item[0], reverse=True)
+    return [item[1] for item in ordered]
+
+
+def build_issue_details(metadata: dict[str, Any], defects: list[str]) -> list[dict[str, Any]]:
+    """Explain each detected defect with evidence, impact, fix, and recheck."""
+    related_face_counts = metadata.get("issue_related_face_counts", {})
+    evidence = {
+        "non_manifold": f"non_manifold_edge_count={metadata.get('non_manifold_edge_count', 0)}, related_face_count={related_face_counts.get('non_manifold', 0)}",
+        "uv_overlap": f"uv_overlap_ratio={metadata.get('uv_overlap_ratio', 0.0)}, uv_overlap_triangle_count={metadata.get('uv_overlap_triangle_count', 0)}, related_face_count={related_face_counts.get('uv_overlap', 0)}",
+        "flipped_normals": f"flipped_normal_count={metadata.get('flipped_normal_count', 0)}, related_face_count={related_face_counts.get('flipped_normals', 0)}",
+        "hole": f"boundary_edge_count={metadata.get('boundary_edge_count', 0)}, related_face_count={related_face_counts.get('hole', 0)}",
+        "stretched_triangles": f"triangle_aspect_stats={metadata.get('triangle_aspect_stats', {})}, related_face_count={related_face_counts.get('stretched_triangles', 0)}",
+        "degenerate_faces": f"degenerate_face_count={metadata.get('degenerate_face_count', 0)}, related_face_count={related_face_counts.get('degenerate_faces', 0)}, triangle_area_stats={metadata.get('triangle_area_stats', {})}",
+    }
+    details = []
+    defect_severity = {
+        "non_manifold": "high",
+        "hole": "high",
+        "degenerate_faces": "high",
+        "uv_overlap": "medium",
+        "flipped_normals": "medium",
+        "stretched_triangles": "low",
+    }
+    for defect in defects:
+        zh = ISSUE_GUIDANCE[defect]["zh"]
+        en = ISSUE_GUIDANCE[defect]["en"]
+        details.append({
+            "defect_type": defect,
+            "severity": defect_severity.get(defect, "medium"),
+            "title_zh": zh[0],
+            "title_en": en[0],
+            "evidence": evidence.get(defect, ""),
+            "what_zh": zh[1],
+            "what_en": en[1],
+            "impact_zh": zh[2],
+            "impact_en": en[2],
+            "repair_zh": zh[3],
+            "repair_en": en[3],
+            "recheck_zh": zh[4],
+            "recheck_en": en[4],
+        })
+    return details
+
+
+def build_complex_warnings(metadata: dict[str, Any], asset_profile: str = "Auto") -> list[dict[str, Any]]:
+    """Report imported-asset conditions that are not automatically failures."""
+    warnings = []
+    if metadata.get("pbr_channel_issue_count", 0) > 0:
+        material_details = build_pbr_issue_breakdown(metadata)
+        material_summary = "; ".join(
+            f"{item['material']}: {', '.join(issue['code'] for issue in item['issues'])}"
+            for item in material_details[:8]
+        )
+        warnings.append({
+            "code": "pbr_channel_wiring",
+            "level": "warning",
+            "evidence": f"pbr_channel_issue_count={metadata.get('pbr_channel_issue_count')}, material_count={metadata.get('material_count', 'not recorded')}; material_issue_summary={material_summary or 'not recorded'}",
+            "material_details": material_details,
+            "message_zh": "发现 PBR 通道连接、颜色空间或贴图有效性问题，可能导致材质在目标引擎中失真。",
+            "message_en": "PBR channel wiring, color-space, or texture-validity issues were found and may change the material in the target engine.",
+            "suggestion_zh": "逐材质检查 Base Color、Normal、Roughness、Metallic、AO、Opacity、Emissive 的输入来源；数据贴图使用 Non-Color。",
+            "suggestion_en": "Inspect Base Color, Normal, Roughness, Metallic, AO, Opacity, and Emissive sources per material; use Non-Color for data maps.",
+        })
+    missing_images = [
+        item for item in (metadata.get("texture_images", []) or [])
+        if not item.get("exists", True)
+    ]
+    if int(metadata.get("missing_texture_count", 0) or 0) > 0 or missing_images:
+        image_names = ", ".join(str(item.get("name", "—")) for item in missing_images[:8])
+        warnings.append({
+            "code": "missing_external_textures",
+            "level": "warning",
+            "evidence": f"missing_texture_count={metadata.get('missing_texture_count', len(missing_images))}, missing_images={image_names or 'not recorded'}",
+            "message_zh": "检测到外部贴图路径无法解析；材质在目标机器或目标引擎中可能显示为默认材质或缺失纹理。",
+            "message_en": "Some external texture paths could not be resolved; materials may fall back to defaults or lose textures on the target machine or engine.",
+            "suggestion_zh": "重新定位贴图、使用相对路径，或将贴图嵌入/打包后再导出，并在干净目录中复检。",
+            "suggestion_en": "Relink textures, use relative paths, or embed/pack them before export; then recheck from a clean directory.",
+        })
+    if metadata.get("textureless_material_count", 0) > 0:
+        names = ", ".join(metadata.get("textureless_materials", [])[:8])
+        warnings.append({
+            "code": "textureless_materials",
+            "level": "info",
+            "evidence": f"textureless_material_count={metadata.get('textureless_material_count')}, materials={names or 'not recorded'}",
+            "message_zh": "部分材质使用常量颜色或程序化输入，没有图片贴图；这本身不代表 PBR 错误。",
+            "message_en": "Some materials use constant colors or procedural inputs without image textures; this is not itself a PBR error.",
+            "suggestion_zh": "确认目标引擎是否支持当前节点；只有需要纹理绘制时才补充图片贴图。",
+            "suggestion_en": "Confirm target-engine node support; add image textures only when texture painting or image-based shading is required.",
+        })
+    boundary_edges = int(metadata.get("boundary_edge_count", 0) or 0)
+    if boundary_edges > 0 and boundary_policy_for_profile(asset_profile) == "open_surface_allowed":
+        warnings.append({
+            "code": "open_boundary_edges",
+            "level": "info",
+            "evidence": f"boundary_edge_count={boundary_edges}, asset_profile={asset_profile}",
+            "message_zh": "检测到开放边界；当前资产档案允许开放曲面，因此没有将其直接判定为模型孔洞。",
+            "message_en": "Open boundaries were detected; the selected asset profile allows open surfaces, so they were not automatically classified as holes.",
+            "suggestion_zh": "确认这些边界是否符合镜片、镜框、布料或展示模型的结构意图。",
+            "suggestion_en": "Confirm that the boundaries are intentional for the asset structure, such as lenses, frames, cloth, or display-only parts.",
+        })
+    if metadata.get("source_missing_uv_object_count", 0) > 0:
+        uv_level = "warning" if metadata.get("texture_image_count", 0) > 0 else "info"
+        warnings.append({
+            "code": "missing_uv",
+            "level": uv_level,
+            "evidence": f"source_missing_uv_object_count={metadata.get('source_missing_uv_object_count')}, source_uv_layer_count={metadata.get('source_uv_layer_count', 0)}",
+            "message_zh": "源文件有网格对象没有 UV；当前结果保留了原始状态，没有自动展开来掩盖问题。" if uv_level == "warning" else "源文件有网格对象没有 UV，若不使用贴图可以接受。",
+            "message_en": "Some source mesh objects have no UVs; the original state was preserved instead of auto-unwrapping." if uv_level == "warning" else "Some source mesh objects have no UVs; this may be acceptable for untextured assets.",
+            "suggestion_zh": "对需要贴图的对象重新展开 UV，并复检重叠、越界、密度和拉伸。",
+            "suggestion_en": "Unwrap UVs for textured objects, then recheck overlap, bounds, density, and stretch.",
+        })
+    if metadata.get("source_unassigned_material_slot_count", 0) > 0:
+        warnings.append({
+            "code": "unassigned_material_slots",
+            "level": "warning",
+            "evidence": f"source_unassigned_material_slot_count={metadata.get('source_unassigned_material_slot_count')}",
+            "message_zh": "发现没有实际材质的空材质槽，可能造成导出后材质索引错位或无效 Draw Call。",
+            "message_en": "Empty material slots were found and may cause material-index mismatches or ineffective draw calls after export.",
+            "suggestion_zh": "删除空槽，重新检查每个面的材质索引，并在目标格式中复检。",
+            "suggestion_en": "Remove empty slots, validate face material indices, and recheck the exported format.",
+        })
+    if metadata.get("source_negative_scale_object_count", 0) or metadata.get("source_zero_scale_object_count", 0):
+        transform_objects = [
+            str(item.get("name", "—")) for item in (metadata.get("source_mesh_objects", []) or [])
+            if item.get("negative_scale") or item.get("zero_scale") or item.get("non_unit_scale")
+        ]
+        warnings.append({
+            "code": "transform_anomaly",
+            "level": "warning",
+            "evidence": f"negative_scale_objects={metadata.get('source_negative_scale_object_count', 0)}, zero_scale_objects={metadata.get('source_zero_scale_object_count', 0)}, affected_objects={', '.join(transform_objects[:8]) or 'not recorded'}",
+            "message_zh": "发现负缩放或接近零的缩放，可能导致法线翻转、镜像不一致或导出变换异常。",
+            "message_en": "Negative or near-zero object scales were found and may cause flipped normals, mirror inconsistencies, or export-transform issues.",
+            "suggestion_zh": "应用缩放，确认镜像意图，再复检法线、切线和导出坐标。",
+            "suggestion_en": "Apply scale, confirm the mirror intent, then recheck normals, tangents, and export coordinates.",
+        })
+    source_unit_system = str(metadata.get("source_unit_system", "NONE") or "NONE")
+    source_unit_scale = float(metadata.get("source_unit_scale_length", 1.0) or 1.0)
+    if source_unit_system != "NONE" and abs(source_unit_scale - 1.0) > 1e-6:
+        warnings.append({
+            "code": "non_default_scene_units",
+            "level": "info",
+            "evidence": f"source_format={metadata.get('source_format', 'unknown')}, unit_system={source_unit_system}, scale_length={source_unit_scale}",
+            "message_zh": "源场景使用了非默认单位缩放；检测结果不代表目标引擎导入后的物理尺寸一定一致。",
+            "message_en": "The source scene uses a non-default unit scale; the inspection does not guarantee identical physical dimensions after target-engine import.",
+            "suggestion_zh": "确认目标项目单位、导出单位和模型实际尺寸，并用标尺或已知尺寸复核。",
+            "suggestion_en": "Confirm project units, export units, and physical dimensions; verify with a ruler or known-size reference.",
+        })
+    if metadata.get("source_lod_missing_levels"):
+        warnings.append({
+            "code": "lod_sequence_gap",
+            "level": "warning",
+            "evidence": f"lod_levels={metadata.get('source_lod_levels')}, missing_levels={metadata.get('source_lod_missing_levels')}",
+            "message_zh": "检测到 LOD 命名序列缺级，运行时可能无法按预期切换。",
+            "message_en": "The LOD naming sequence has missing levels and may not switch as expected at runtime.",
+            "suggestion_zh": "补齐 LOD 级别或统一命名，并检查每级面数和屏幕占用范围。",
+            "suggestion_en": "Fill the missing LOD levels or normalize naming, then check triangle counts and screen ranges.",
+        })
+    if metadata.get("material_slot_overflow") or metadata.get("source_material_slot_overflow_object_count", 0) > 0:
+        warnings.append({
+            "code": "material_slot_overflow",
+            "level": "warning",
+            "evidence": f"material_slot_count={metadata.get('material_slot_count')}, unique_material_count={metadata.get('unique_material_count')}, source_overflow_objects={metadata.get('source_material_slot_overflow_object_count', 0)}",
+            "message_zh": "材质槽数量偏多，可能增加 Draw Call、切换成本和维护复杂度。",
+            "message_en": "The material-slot count is high and may increase draw calls, switching cost, and maintenance complexity.",
+            "suggestion_zh": "合并可复用材质，清理重复槽，并按目标平台预算控制材质数量。",
+            "suggestion_en": "Merge reusable materials, remove duplicate slots, and cap material count for the target platform.",
+        })
+    if metadata.get("loading_risk") in {"medium", "high"}:
+        warnings.append({
+            "code": "loading_performance",
+            "level": "warning" if metadata.get("loading_risk") == "high" else "info",
+            "evidence": f"loading_risk={metadata.get('loading_risk')}, estimated_load_time_seconds={metadata.get('estimated_load_time_seconds')}, estimated_texture_memory_bytes={metadata.get('estimated_texture_memory_bytes')}, estimated_draw_calls={metadata.get('estimated_draw_calls')}",
+            "message_zh": "文件体积、纹理内存、Draw Call 或加载时间存在实时/XR 风险。",
+            "message_en": "File size, texture memory, draw calls, or load time may create real-time/XR performance risk.",
+            "suggestion_zh": "压缩纹理、减少材质槽、生成 LOD，并在目标设备上实测加载时间和峰值显存。",
+            "suggestion_en": "Compress textures, reduce material slots, generate LODs, and measure load time and peak memory on target hardware.",
+        })
+    if metadata.get("source_has_armature") or metadata.get("source_has_animation"):
+        rig_evidence = f"unbound_vertex_count={metadata.get('unbound_vertex_count', 0)}, weight_sum_error_count={metadata.get('weight_sum_error_count', 0)}, over_influenced_vertex_count={metadata.get('over_influenced_vertex_count', 0)}, animation_playability={metadata.get('animation_playability', 'not recorded')}, pose_frames={metadata.get('animation_probe_frame_count', 0)}, self_intersection_check={metadata.get('deformation_self_intersection_check', 'not recorded')}, sampled_overlap_pairs={metadata.get('deformation_self_intersection_pair_count', 0)}"
+        warnings.append({
+            "code": "animation_skinning",
+            "level": "warning" if any(metadata.get(key, 0) for key in ("unbound_vertex_count", "weight_sum_error_count", "over_influenced_vertex_count")) or metadata.get("deformation_self_intersection_check") == "detected_sampled_overlap" else "info",
+            "evidence": rig_evidence,
+            "message_zh": "检测到骨骼/动画，已检查绑定顶点、权重、有限姿态和采样帧的非相邻面重叠；采样不是所有姿态的证明。",
+            "message_en": "Armature/animation data was found. Binding, weights, finite poses, and sampled non-adjacent overlaps were checked; sampling is not proof for every pose.",
+            "suggestion_zh": "修复未绑定顶点、权重和影响骨骼数；若采样发现重叠，逐帧检查对应帧并调整权重、骨骼或碰撞体。",
+            "suggestion_en": "Fix unbound vertices, weight sums, and excessive influences; if sampled overlaps were found, inspect the listed frames and adjust weights, bones, or colliders.",
+        })
+    component_details = metadata.get("component_details") or []
+    if component_details:
+        largest = max(component_details, key=lambda item: item.get("face_count", 0), default={})
+        warnings.append({
+            "code": "component_breakdown",
+            "level": "info",
+            "evidence": f"component_count={len(component_details)}, largest_component_faces={largest.get('face_count', 0)}",
+            "message_zh": "已对断开几何组件逐个统计顶点、面和边数量；这能帮助区分主体、附件、碰撞体或导出残留。",
+            "message_en": "Disconnected components were profiled by vertex, face, and edge counts to distinguish bodies, attachments, colliders, or export residue.",
+            "suggestion_zh": "结合组件名称和面数判断是否需要独立材质、LOD、碰撞或分开导出。",
+            "suggestion_en": "Use component names and face counts to decide whether separate materials, LODs, colliders, or exports are needed.",
+        })
+    if metadata.get("source_mesh_object_count", 1) > 1:
+        warnings.append({
+            "code": "multiple_mesh_objects",
+            "level": "info",
+            "evidence": f"source_mesh_object_count={metadata['source_mesh_object_count']}",
+            "message_zh": "源文件包含多个网格对象；当前页面将它们合并后做整体几何检查。",
+            "message_en": "The source contains multiple mesh objects; this page joins them for a scene-level geometry check.",
+            "suggestion_zh": "确认独立部件、LOD、碰撞体和材质槽的边界，必要时分对象复检。",
+            "suggestion_en": "Confirm boundaries between parts, LODs, colliders, and material slots; inspect objects separately when needed.",
+        })
+    if metadata.get("source_has_armature") or metadata.get("source_has_animation"):
+        warnings.append({
+            "code": "rig_or_animation_present",
+            "level": "info",
+            "evidence": f"source_has_armature={metadata.get('source_has_armature', False)}, source_has_animation={metadata.get('source_has_animation', False)}",
+            "message_zh": "源文件包含骨骼或动画；当前结果只覆盖几何、UV 和法线质量。",
+            "message_en": "The source contains an armature or animation; the current result covers geometry, UV, and normals only.",
+            "suggestion_zh": "另外检查蒙皮权重、骨骼绑定、动画播放和目标引擎中的变形。",
+            "suggestion_en": "Separately validate skin weights, bindings, animation playback, and deformation in the target engine.",
+        })
+    if metadata.get("loose_vertex_count", 0) > 0:
+        warnings.append({
+            "code": "loose_vertices",
+            "level": "warning",
+            "evidence": f"loose_vertex_count={metadata['loose_vertex_count']}",
+            "message_zh": "发现未被任何边连接的孤立顶点，可能来自导出残留或断开的几何。",
+            "message_en": "Unconnected vertices were found; they may be export residue or detached geometry.",
+            "suggestion_zh": "清理孤立顶点，并确认断开几何是否有意保留。",
+            "suggestion_en": "Remove loose vertices and confirm whether detached geometry is intentional.",
+        })
+    if metadata.get("zero_length_edge_count", 0) > 0:
+        warnings.append({
+            "code": "zero_length_edges",
+            "level": "warning",
+            "evidence": f"zero_length_edge_count={metadata['zero_length_edge_count']}",
+            "message_zh": "发现长度接近 0 的边，可能引发退化面、法线或 UV 问题。",
+            "message_en": "Near-zero-length edges were found and may cause degenerate faces, normal, or UV issues.",
+            "suggestion_zh": "合并重复顶点并删除零长度边，然后重新计算法线和 UV。",
+            "suggestion_en": "Merge duplicate vertices and remove zero-length edges, then rebuild normals and UVs.",
+        })
+    if metadata.get("connected_component_count", 1) > 1:
+        warnings.append({
+            "code": "detached_components",
+            "level": "info",
+            "evidence": f"connected_component_count={metadata['connected_component_count']}",
+            "message_zh": "资产包含多个互不连接的几何组件，这不一定是错误。",
+            "message_en": "The asset contains multiple disconnected geometry components; this is not necessarily an error.",
+            "suggestion_zh": "确认这些组件是否应作为独立部件、碰撞体或装配件存在。",
+            "suggestion_en": "Confirm whether the components are intended as separate parts, colliders, or assembly pieces.",
+        })
+    if metadata.get("ngon_face_count", 0) > 0:
+        warnings.append({
+            "code": "ngons",
+            "level": "info",
+            "evidence": f"ngon_face_count={metadata['ngon_face_count']}",
+            "message_zh": "发现 N-gon 面；不同引擎或修改器可能采用不同的三角化结果。",
+            "message_en": "N-gon faces were found; different engines or modifiers may triangulate them differently.",
+            "suggestion_zh": "在目标引擎中预览，或在交付前按项目规范显式三角化。",
+            "suggestion_en": "Preview in the target engine or triangulate explicitly before delivery.",
+        })
+    return warnings
+
+
+def build_pbr_issue_breakdown(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize raw Blender PBR issue codes into material-level evidence."""
+    labels = {
+        "expected_non_color": (
+            "数据贴图没有使用 Non-Color 颜色空间",
+            "A data map is not using the Non-Color color space",
+        ),
+        "possible_wrong_channel": (
+            "贴图名称提示它可能连接到了不匹配的通道（需人工确认）",
+            "The texture name suggests a possible channel mismatch (manual confirmation required)",
+        ),
+        "missing_normal_map_node": (
+            "Normal 贴图直接连接，未经过 Normal Map 节点",
+            "The Normal texture is connected directly without a Normal Map node",
+        ),
+        "material_without_nodes": (
+            "材质没有节点树",
+            "The material has no node tree",
+        ),
+        "missing_principled_bsdf": (
+            "没有检测到 Principled BSDF 节点",
+            "No Principled BSDF node was detected",
+        ),
+    }
+    details = []
+    for report in metadata.get("pbr_material_reports", []) or []:
+        raw_issues = [str(issue) for issue in report.get("issues", [])]
+        if not raw_issues:
+            continue
+        issue_occurrences = {}
+        for code in raw_issues:
+            issue_occurrences[code] = int(issue_occurrences.get(code, 0)) + 1
+        issue_details = []
+        for code, occurrences in issue_occurrences.items():
+            channel, _, reason = code.partition(":")
+            zh, en = labels.get(reason or channel, (code, code))
+            issue_details.append({
+                "code": code,
+                "channel": channel if reason else "material",
+                "reason_zh": zh,
+                "reason_en": en,
+                "occurrences": occurrences,
+            })
+        details.append({"material": str(report.get("name", "—")), "issues": issue_details})
+    return details[:100]
+
+
+def build_inspection_sections(metadata: dict[str, Any], defects: list[str]) -> list[dict[str, Any]]:
+    """Build the five operator-facing quality sections requested by the user."""
+    vertex_count = metadata.get("vertex_count", 0)
+    face_count = metadata.get("face_count", 0)
+    source_meshes = metadata.get("source_mesh_object_count", 1 if vertex_count or face_count else 0)
+    components = metadata.get("connected_component_count", 1 if vertex_count or face_count else 0)
+    component_details = metadata.get("component_details") or []
+    component_summary = ", ".join(
+        f"{item.get('component_id', idx)}:v{item.get('vertex_count', 0)}/f{item.get('face_count', 0)}/e{item.get('edge_count', 0)}"
+        for idx, item in enumerate(component_details[:12], start=1)
+    ) or "not recorded"
+    source_object_summary = ", ".join(
+        f"{item.get('name', 'object')}:v{item.get('vertex_count', 0)}/f{item.get('face_count', 0)}"
+        for item in (metadata.get("source_mesh_objects") or [])[:12]
+    ) or "not recorded"
+    p95 = metadata.get("triangle_aspect_stats", {}).get("p95", 0)
+    ngons = metadata.get("ngon_face_count", 0)
+    uv_out = metadata.get("uv_out_of_bounds_loop_count", 0)
+    uv_zero = metadata.get("uv_zero_area_triangle_count", 0)
+    overlap = metadata.get("uv_overlap_ratio", 0.0)
+    missing_textures = metadata.get("missing_texture_count", 0)
+    texture_stats_available = "texture_image_count" in metadata
+    texture_count = metadata.get("texture_image_count", None)
+    low_res = metadata.get("low_resolution_texture_count", 0)
+    uv_density = metadata.get("uv_density_stats", {})
+    uv_stretch = metadata.get("uv_stretch_stats", {})
+    pbr_issues = metadata.get("pbr_channel_issue_count", 0)
+    textureless_materials = int(metadata.get("textureless_material_count", 0) or 0)
+    material_slots = metadata.get("material_slot_count", metadata.get("source_material_slot_count", "not recorded"))
+
+    def section(key, title_zh, title_en, status, status_zh, status_en, evidence, summary_zh, summary_en, suggestion_zh, suggestion_en):
+        return {
+            "key": key,
+            "title_zh": title_zh,
+            "title_en": title_en,
+            "status": status,
+            "status_zh": status_zh,
+            "status_en": status_en,
+            "evidence": evidence,
+            "summary_zh": summary_zh,
+            "summary_en": summary_en,
+            "suggestion_zh": suggestion_zh,
+            "suggestion_en": suggestion_en,
+        }
+
+    geometry_status = "fail" if not vertex_count or not face_count else ("attention" if defects else "pass")
+    geometry_status_zh = {"fail": "未通过", "attention": "需要关注", "pass": "通过"}[geometry_status]
+    geometry_status_en = {"fail": "FAIL", "attention": "ATTENTION", "pass": "PASS"}[geometry_status]
+    topology_attention = bool(ngons or p95 > 8 or metadata.get("zero_length_edge_count", 0) or (7.2 <= p95 <= 8))
+    topology_status = "attention" if topology_attention else "pass"
+    uv_stats_available = "uv_layer_count" in metadata
+    uv_status = "unknown" if not uv_stats_available else ("fail" if "uv_overlap" in defects or uv_out or uv_zero or uv_stretch.get("p95", 0) >= 4 else ("attention" if metadata.get("source_missing_uv_object_count", 0) or uv_stretch.get("p95", 0) >= 2 else "pass"))
+    texture_status = "unknown" if not texture_stats_available else ("fail" if missing_textures else ("attention" if low_res or pbr_issues else "pass"))
+    status_zh = {"fail": "未通过", "attention": "需要关注", "pass": "通过"}
+    status_en = {"fail": "FAIL", "attention": "ATTENTION", "pass": "PASS"}
+    status_zh["unknown"] = "未提供统计"
+    status_en["unknown"] = "NOT AVAILABLE"
+    uv_valid = int(metadata.get("uv_valid_triangle_count", 0) or 0)
+    uv_analyzed = int(metadata.get("uv_analysis_analyzed_triangle_count", 0) or 0)
+    if uv_status == "unknown":
+        uv_summary_zh = "当前样本没有 UV 统计，无法确认 UV 层、越界和零面积 UV 三角形。"
+        uv_summary_en = "UV statistics are not present in this legacy sample, so UV layers, bounds, and zero-area UV triangles cannot be confirmed."
+    elif uv_analyzed and uv_valid == 0:
+        uv_summary_zh = f"UV 层存在，但有效 UV 三角形为 0/{uv_analyzed}；当前 UV 图和热力图不可用于判断纹理布局。"
+        uv_summary_en = f"A UV layer exists, but usable UV triangles are 0/{uv_analyzed}; the current UV layout and heatmap are not reliable for texturing."
+    elif uv_status != "pass":
+        uv_summary_zh = "UV 存在重叠、越界或零面积 UV 三角形，或部分源对象没有原始 UV。"
+        uv_summary_en = "UV overlap, out-of-bounds coordinates, zero-area UV triangles, or missing source UVs were detected."
+    else:
+        uv_summary_zh = "UV 层存在，当前未发现明显的重叠、越界或零面积 UV 问题。"
+        uv_summary_en = "A UV layer is present with no obvious overlap, out-of-bounds, or zero-area UV issue."
+
+    return [
+        section("geometry_generation", "几何生成", "Geometry generation", geometry_status, geometry_status_zh, geometry_status_en,
+                f"source_mesh_object_count={source_meshes}, vertex_count={vertex_count}, face_count={face_count}, bounding_box_dimensions={metadata.get('bounding_box_dimensions', 'not recorded')}",
+                "已生成可检查的网格几何，并完成基础尺寸和面/点数量检查。" if geometry_status != "fail" else "没有得到可用的顶点或面，无法进行可靠的几何质检。",
+                "Usable mesh geometry was generated and basic size, vertex, and face checks completed." if geometry_status != "fail" else "No usable vertices or faces were found, so geometry quality cannot be assessed reliably.",
+                "继续检查比例、尺寸单位和目标引擎中的显示结果。" if geometry_status != "fail" else "回到生成或导出流程，确保 FBX/OBJ 中包含有效网格。",
+                "Continue with scale, unit, and target-engine display checks." if geometry_status != "fail" else "Return to the generation or export step and ensure the FBX/OBJ contains valid mesh geometry."),
+        section("component_split", "组件拆分", "Component split", "attention" if source_meshes > 1 or components > 1 else "pass", "需要关注" if source_meshes > 1 or components > 1 else "通过", "ATTENTION" if source_meshes > 1 or components > 1 else "PASS",
+                f"source_mesh_object_count={source_meshes}, connected_component_count={components}, source_objects={source_object_summary}, component_breakdown={component_summary}",
+                "源文件包含多个网格对象或互不连接的几何组件；当前检测按整体资产执行。" if source_meshes > 1 or components > 1 else "资产组件关系简单，未发现额外的拆分提醒。",
+                "The source contains multiple mesh objects or disconnected geometry components; the current check is scene-level." if source_meshes > 1 or components > 1 else "The asset has a simple component structure with no additional split warning.",
+                "确认独立部件、LOD、碰撞体和材质槽是否应该分开维护。",
+                "Confirm whether separate parts, LODs, colliders, and material slots should remain independently managed."),
+        section("low_poly_topology", "低模拓扑", "Low-poly topology", "attention" if topology_attention else "pass", "需要关注" if topology_attention else "通过", "ATTENTION" if topology_attention else "PASS",
+                f"triangle_count={metadata.get('triangle_count', metadata.get('face_count', 'not recorded'))}, ngon_face_count={ngons}, triangle_aspect_p95={p95}, degenerate_face_count={metadata.get('degenerate_face_count', 0)}",
+                "拓扑统计已完成；N-gon、细长三角形或零长度边需要结合目标用途进一步处理。" if topology_attention else "拓扑统计正常，当前未发现明显的低模结构提醒。",
+                "Topology statistics are complete; N-gons, sliver triangles, or zero-length edges need task-specific review." if topology_attention else "Topology statistics look normal with no obvious low-poly warning.",
+                "按目标平台预算检查面数，并在交付前显式三角化和复检阴影。",
+                "Check the target-platform budget, triangulate explicitly before delivery, and recheck shading."),
+        section("uv_unwrap", "UV 展开", "UV unwrapping", uv_status, status_zh[uv_status], status_en[uv_status],
+                f"uv_layer_count={metadata.get('uv_layer_count', 'not recorded')}, uv_island_count={metadata.get('uv_island_count', 'not recorded')}, uv_density_p05={uv_density.get('p05', 'not recorded')}, uv_density_median={uv_density.get('median', 'not recorded')}, uv_stretch_p95={uv_stretch.get('p95', 'not recorded')}, uv_min_island_gap={metadata.get('uv_min_island_gap', 'not recorded')}, heatmap=uv_heatmap.png",
+                uv_summary_zh + f" UV 岛 {metadata.get('uv_island_count', '未统计')} 个，密度 P05={uv_density.get('p05', '未统计')}，拉伸 P95={uv_stretch.get('p95', '未统计')}。",
+                uv_summary_en + f" UV islands: {metadata.get('uv_island_count', 'not recorded')}; density P05={uv_density.get('p05', 'not recorded')}; stretch P95={uv_stretch.get('p95', 'not recorded')}.",
+                "查看 UV 拉伸/密度热力图；对低密度或高拉伸区域重新展开、增加岛间距，并确保重要区域获得足够像素密度。",
+                "Use the UV stretch/density heatmap; re-unwrap low-density or highly stretched regions, increase island padding, and prioritize pixels for important surfaces."),
+        section("texture_painting", "纹理绘制", "Texture painting", texture_status, status_zh[texture_status], status_en[texture_status],
+                f"material_count={metadata.get('material_count', 'not recorded')}, material_slot_count={material_slots}, texture_image_count={texture_count if texture_stats_available else 'not recorded'}, missing_texture_count={missing_textures if texture_stats_available else 'not recorded'}, low_resolution_texture_count={low_res if texture_stats_available else 'not recorded'}, pbr_channel_issue_count={pbr_issues}",
+                ("发现缺失贴图、低分辨率贴图或 PBR 通道连接/颜色空间问题。纯色或程序化材质没有图片贴图，但这本身不构成错误。" if texture_status != "unknown" else "当前样本没有纹理统计，无法确认 PBR 通道、贴图文件和分辨率。") if texture_status != "pass" else ("材质使用纯色/程序化输入或图片纹理；未发现缺失贴图和可验证的 PBR 连接错误。" if textureless_materials else "材质、PBR 通道和图片纹理连接正常，未发现缺失贴图。"),
+                ("Missing/low-resolution textures or verifiable PBR wiring/color-space issues were found. Constant or procedural materials without image textures are not errors by themselves." if texture_status != "unknown" else "Texture statistics are not present in this legacy sample, so PBR channels, files, and resolution cannot be confirmed.") if texture_status != "pass" else ("Materials use constant/procedural inputs or image textures; no missing texture or verifiable PBR wiring error was found." if textureless_materials else "Material, PBR channels, and image-texture connections look complete."),
+                "逐材质检查 Base Color、Normal、Roughness、Metallic、AO、Opacity、Emissive；Normal/Roughness/Metallic/AO 应使用 Non-Color，并避免材质槽过多。",
+                "Inspect Base Color, Normal, Roughness, Metallic, AO, Opacity, and Emissive per material; use Non-Color for Normal/Roughness/Metallic/AO and avoid excessive material slots."),
+    ]
+
+
+def build_asset_readiness(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Expose separate material, delivery-performance, and rig readiness signals."""
+    material_penalty = min(
+        100,
+        int(metadata.get("pbr_channel_issue_count", 0) or 0) * 12
+        + int(metadata.get("missing_texture_count", 0) or 0) * 10
+        + (20 if metadata.get("material_slot_overflow") else 0),
+    )
+    material_score = max(0, 100 - material_penalty)
+    material_grade = "A" if material_score >= 90 else "B" if material_score >= 75 else "C" if material_score >= 60 else "D"
+    loading_risk = metadata.get("loading_risk", "unknown")
+    rig_errors = sum(int(metadata.get(key, 0) or 0) for key in ("unbound_vertex_count", "weight_sum_error_count", "over_influenced_vertex_count"))
+    if metadata.get("missing_armature_modifier"):
+        rig_errors += 1
+    if not metadata.get("source_has_armature") and not metadata.get("source_has_animation"):
+        animation_grade = "N/A"
+    else:
+        animation_grade = "A" if rig_errors == 0 and metadata.get("animation_playability") != "failed_nonfinite_pose_probe" and metadata.get("deformation_self_intersection_check") != "detected_sampled_overlap" else "C"
+    return {
+        "material_score": material_score,
+        "material_grade": material_grade,
+        "material_issue_count": metadata.get("pbr_channel_issue_count", 0),
+        "loading_risk": loading_risk,
+        "asset_file_size_bytes": metadata.get("asset_file_size_bytes", metadata.get("source_file_size_bytes", 0)),
+        "estimated_texture_memory_bytes": metadata.get("estimated_texture_memory_bytes", 0),
+        "estimated_load_time_seconds": metadata.get("estimated_load_time_seconds", 0),
+        "estimated_draw_calls": metadata.get("estimated_draw_calls", 0),
+        "animation_grade": animation_grade,
+        "rig_issue_count": rig_errors,
+        "animation_playability": metadata.get("animation_playability", "not_available"),
     }
 
 
@@ -166,7 +1548,8 @@ def validate_prediction(prediction: dict[str, Any]) -> tuple[bool, list[str]]:
 
 
 def get_vlm(row: dict[str, Any], manifest: Path, condition: str, model_id: str, adapter: Path | None,
-            min_pixels: int, max_pixels: int, max_new_tokens: int, offload_dir: Path) -> dict[str, Any]:
+            min_pixels: int, max_pixels: int, max_new_tokens: int, offload_dir: Path,
+            reference_image: str | None = None, generation_prompt: str = "") -> dict[str, Any]:
     cache_key = "|".join([model_id, str(adapter or ""), str(min_pixels), str(max_pixels), str(offload_dir)])
     if cache_key not in _MODEL_CACHE:
         model, processor = load_stack(
@@ -188,7 +1571,14 @@ def get_vlm(row: dict[str, Any], manifest: Path, condition: str, model_id: str, 
 
     payload = build_condition(row, condition, manifest)
     content = [{"type": "image", "image": path} for path in payload["image_paths"]]
-    content.append({"type": "text", "text": payload["prompt"]})
+    if reference_image and Path(reference_image).exists():
+        content.append({"type": "image", "image": reference_image})
+    soft_context = []
+    if reference_image:
+        soft_context.append("A reference image was appended after the rendered evidence. Compare the asset to it and describe identity mismatches.")
+    if generation_prompt.strip():
+        soft_context.append(f"Generation prompt to verify: {generation_prompt.strip()}")
+    content.append({"type": "text", "text": payload["prompt"] + ("\n\nSoft evaluation context:\n" + "\n".join(soft_context) if soft_context else "")})
     messages = [{"role": "user", "content": content}]
     prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(messages)
@@ -213,7 +1603,9 @@ def get_vlm(row: dict[str, Any], manifest: Path, condition: str, model_id: str, 
 
 def build_result(row: dict[str, Any], manifest: Path, mode: str, condition: str, model_id: str,
                  adapter_text: str, max_new_tokens: int, min_pixels: int, max_pixels: int,
-                 offload_text: str) -> tuple[dict[str, Any], dict[str, Any]]:
+                 offload_text: str, target_face_budget: str, reference_image: str | None = None,
+                 generation_prompt: str = "", thresholds: dict[str, Any] | None = None,
+                 asset_profile: str = "Auto") -> tuple[dict[str, Any], dict[str, Any]]:
     adapter = Path(adapter_text).expanduser() if adapter_text.strip() else None
     if adapter and not adapter.is_absolute():
         adapter = (ROOT / adapter).resolve()
@@ -221,13 +1613,69 @@ def build_result(row: dict[str, Any], manifest: Path, mode: str, condition: str,
     if not offload_dir.is_absolute():
         offload_dir = (ROOT / offload_dir).resolve()
 
-    rule_result = run_rule(row)
+    thresholds = thresholds or load_thresholds()
+    reference_ready = bool(reference_image)
+    prompt_ready = bool(generation_prompt.strip())
+    rule_result = run_rule(
+        row,
+        target_face_budget,
+        reference_ready,
+        prompt_ready,
+        False,
+        thresholds,
+        asset_profile,
+    )
+    resolved_profile = rule_result["prediction"].get("asset_profile", resolve_asset_profile(asset_profile, row.get("metadata", {}), target_face_budget))
     vlm_result = None
     if mode in {"VLM diagnosis", "Hybrid review"}:
-        vlm_result = get_vlm(row, manifest, condition, model_id, adapter, min_pixels, max_pixels, max_new_tokens, offload_dir)
+        vlm_result = get_vlm(row, manifest, condition, model_id, adapter, min_pixels, max_pixels, max_new_tokens, offload_dir, reference_image, generation_prompt)
+        rule_result["prediction"]["health_score"] = compute_health_score(
+            row.get("metadata", {}), rule_result["prediction"].get("defect_types", []), target_face_budget,
+            reference_ready, prompt_ready, True,
+            int(thresholds["max_faces"]),
+            asset_profile=resolved_profile,
+        )
 
     rule_prediction = rule_result["prediction"]
     vlm_prediction = vlm_result["prediction"] if vlm_result else None
+    if isinstance(vlm_prediction, dict) and "issue_details" not in vlm_prediction:
+        vlm_prediction = dict(vlm_prediction)
+        vlm_prediction["issue_details"] = build_issue_details(
+            row.get("metadata", {}),
+            vlm_prediction.get("defect_types", []) if isinstance(vlm_prediction.get("defect_types"), list) else [],
+        )
+    if isinstance(vlm_prediction, dict) and "warnings" not in vlm_prediction:
+        vlm_prediction = dict(vlm_prediction)
+        vlm_prediction["warnings"] = build_complex_warnings(row.get("metadata", {}), resolved_profile)
+    if isinstance(vlm_prediction, dict) and "inspection_sections" not in vlm_prediction:
+        vlm_prediction = dict(vlm_prediction)
+        vlm_prediction["inspection_sections"] = build_inspection_sections(
+            row.get("metadata", {}),
+            vlm_prediction.get("defect_types", []) if isinstance(vlm_prediction.get("defect_types"), list) else [],
+        )
+    if isinstance(vlm_prediction, dict) and "asset_readiness" not in vlm_prediction:
+        vlm_prediction = dict(vlm_prediction)
+        vlm_prediction["asset_readiness"] = build_asset_readiness(row.get("metadata", {}))
+    if isinstance(vlm_prediction, dict) and "confidence_report" not in vlm_prediction:
+        vlm_prediction = dict(vlm_prediction)
+        vlm_prediction["confidence_report"] = build_confidence_report(
+            row.get("metadata", {}),
+            vlm_prediction.get("defect_types", []) if isinstance(vlm_prediction.get("defect_types"), list) else [],
+            target_face_budget,
+            thresholds,
+        )
+    if isinstance(vlm_prediction, dict) and "health_score" not in vlm_prediction:
+        vlm_prediction = dict(vlm_prediction)
+        vlm_prediction["health_score"] = compute_health_score(
+            row.get("metadata", {}),
+            vlm_prediction.get("defect_types", []) if isinstance(vlm_prediction.get("defect_types"), list) else [],
+            target_face_budget,
+            reference_ready,
+            prompt_ready,
+            bool(vlm_result),
+            int(thresholds["max_faces"]),
+            asset_profile=resolved_profile,
+        )
     agreement = None
     review_required = False
     disagreement_reasons: list[str] = []
@@ -263,6 +1711,17 @@ def build_result(row: dict[str, Any], manifest: Path, mode: str, condition: str,
             selected["vlm_severity"] = vlm_prediction.get("severity")
         selected_source = "rule_gate_plus_vlm_explanation"
 
+    selected = dict(selected)
+    selected["asset_profile"] = resolved_profile
+    # The numeric score is always derived from measured hard metrics. VLM
+    # output can add explanations or soft concerns, but it must not replace
+    # the reproducible score with an uncalibrated subjective judgment.
+    selected["health_score"] = rule_prediction.get("health_score")
+    selected["inspection_coverage"] = build_inspection_coverage(row.get("metadata", {}))
+    selected["inspection_coverage_details"] = build_inspection_coverage_details(row.get("metadata", {}))
+    selected["issues"] = build_unified_issues(row.get("metadata", {}), selected, target_face_budget, thresholds)
+    selected["issues"] = prioritize_issue_cards(selected["issues"], selected["health_score"])
+
     result = {
         "asset_id": row.get("scene_id", row.get("id")),
         "sample_id": row["id"],
@@ -278,8 +1737,594 @@ def build_result(row: dict[str, Any], manifest: Path, mode: str, condition: str,
         "disagreement_reasons": disagreement_reasons,
         "metadata": compact_metadata(row.get("metadata", {})),
         "generalization": row.get("generalization"),
+        "soft_inputs": {
+            "reference_image_provided": reference_ready,
+            "generation_prompt_provided": prompt_ready,
+        },
     }
     return result, resolve_image_paths(row, manifest)
+
+
+def _format_bytes(value: Any) -> str:
+    try:
+        number = float(value or 0)
+    except (TypeError, ValueError):
+        return "—"
+    units = ("B", "KB", "MB", "GB", "TB")
+    index = 0
+    while number >= 1024 and index < len(units) - 1:
+        number /= 1024
+        index += 1
+    return f"{number:.1f} {units[index]}"
+
+
+def _render_canonical_issue_cards(result: dict[str, Any], language: str) -> str:
+    """Render the canonical issue protocol without rebuilding parallel card data."""
+    selected = result["selected_result"]
+    is_zh = language == "中文"
+    palette = {
+        "red": ("#fff1f0", "#cf1322", "#a8071a"),
+        "orange": ("#fff7e6", "#d46b08", "#ad4e00"),
+        "blue": ("#e6f4ff", "#1677ff", "#0958d9"),
+        "green": ("#f6ffed", "#389e0d", "#237804"),
+    }
+    severity_zh = {"none": "无", "low": "低", "medium": "中", "high": "高"}
+    status_zh = {"fail": "未通过", "attention": "需要关注", "near_threshold": "接近阈值", "info": "信息提醒"}
+    status_en = {"fail": "FAIL", "attention": "NEEDS ATTENTION", "near_threshold": "NEAR THRESHOLD", "info": "INFO"}
+    coverage_zh = {"checked": "已检查", "sampled": "采样估计", "not_checked": "未检测", "not_applicable": "不适用"}
+    coverage_en = {"checked": "checked", "sampled": "sampled estimate", "not_checked": "not checked", "not_applicable": "not applicable"}
+    def coverage_label(value):
+        value = str(value)
+        if value.startswith("sampled:"):
+            ratio = value.split(":", 1)[1]
+            return f"采样估计 · {ratio}" if is_zh else f"sampled estimate · {ratio}"
+        return (coverage_zh if is_zh else coverage_en).get(value, value)
+    cards = []
+    info_issues = []
+    for issue in selected.get("issues", []):
+        status = issue.get("status", "info")
+        if status == "info":
+            info_issues.append(issue)
+            continue
+        color = "red" if issue.get("blocking") else "orange" if status in {"fail", "attention", "near_threshold"} else "blue"
+        background, border, text = palette[color]
+        title = issue.get("title_zh" if is_zh else "title_en", issue.get("issue_id", "issue"))
+        status_label = status_zh.get(status, status) if is_zh else status_en.get(status, status)
+        coverage = issue.get("coverage", "checked")
+        coverage_label_text = coverage_label(coverage)
+        locator_data = issue.get("locator", {})
+        locator = locator_data.get("label_zh" if is_zh else "label_en", "—")
+        related_face_count = locator_data.get("related_face_count")
+        related_face_line = (
+            f"<div><b>关联面数：</b>{html.escape(str(related_face_count))}</div>"
+            if is_zh and related_face_count is not None else
+            f"<div><b>Related face count:</b> {html.escape(str(related_face_count))}</div>"
+            if not is_zh and related_face_count is not None else ""
+        )
+        object_names = locator_data.get("object_names") or []
+        object_line = (
+            f"<div><b>问题对象：</b>{html.escape('、'.join(object_names))}"
+            f"（共 {html.escape(str(locator_data.get('object_count', len(object_names))))} 个）</div>"
+            if is_zh and object_names else
+            f"<div><b>Issue objects:</b> {html.escape(', '.join(object_names))}"
+            f" ({html.escape(str(locator_data.get('object_count', len(object_names))))} objects)</div>"
+            if not is_zh and object_names else ""
+        )
+        material_details = issue.get("material_details") or []
+        material_details_html = ""
+        if material_details:
+            material_rows = []
+            for material in material_details[:12]:
+                material_name = material.get("material", "—")
+                item_rows = []
+                for item in material.get("issues", [])[:12]:
+                    channel = item.get("channel", "material")
+                    reason = item.get("reason_zh" if is_zh else "reason_en", item.get("code", "—"))
+                    occurrences = int(item.get("occurrences", 1) or 1)
+                    occurrence_text = f"（出现 {occurrences} 次）" if is_zh and occurrences > 1 else f" ({occurrences} occurrences)" if not is_zh and occurrences > 1 else ""
+                    item_rows.append(f"<li><code>{html.escape(str(channel))}</code>：{html.escape(str(reason))}{html.escape(occurrence_text)}</li>")
+                material_rows.append(f"<li><b>{html.escape(str(material_name))}</b><ul>{''.join(item_rows)}</ul></li>")
+            material_title = "材质 / 通道明细" if is_zh else "Material / channel details"
+            material_details_html = f"<div><b>{material_title}：</b><ul>{''.join(material_rows)}</ul></div>"
+        current = issue.get("current_value")
+        threshold = issue.get("threshold")
+        unit = issue.get("unit", "")
+        threshold_line = "—" if current is None and threshold is None else f"{current}{unit} / {threshold}{unit}"
+        profile_priority = issue.get("profile_priority", 0.0)
+        profile_component = issue.get("profile_component") or "—"
+        profile_component_label = {
+            "geometry_and_defects": "几何" if is_zh else "Geometry",
+            "uv": "UV",
+            "materials": "材质" if is_zh else "Materials",
+            "runtime": "运行时" if is_zh else "Runtime",
+            "skinning": "蒙皮" if is_zh else "Skinning",
+            "animation": "动画" if is_zh else "Animation",
+        }.get(profile_component, profile_component)
+        profile_priority_line = (
+            f"档案优先级：{profile_priority}；影响分项：{profile_component_label}"
+            if is_zh else
+            f"Profile priority: {profile_priority}; component: {profile_component_label}"
+        )
+        if is_zh:
+            summary = f"严重度：{severity_zh.get(issue.get('severity', 'medium'), issue.get('severity', 'medium'))} · {status_label} · 检测状态：{coverage_label_text} · 档案优先级：{profile_priority}"
+            details_html = "".join([
+                f"<div><b>档案排序依据：</b>{html.escape(profile_priority_line)}</div>",
+                f"<div><b>定位证据：</b>{html.escape(str(locator))}</div>",
+                related_face_line,
+                object_line,
+                material_details_html,
+                f"<div><b>当前值 / 阈值：</b>{html.escape(str(threshold_line))}</div>",
+                f"<div><b>证据：</b>{html.escape(str(issue.get('evidence', '')))}</div>",
+                f"<div><b>影响：</b>{html.escape(str(issue.get('impact_zh', '')))}</div>",
+                f"<div><b>修复：</b>{html.escape(str(issue.get('fix_zh', '')))}</div>",
+                f"<div><b>复检：</b>{html.escape(str(issue.get('recheck_zh', '')))}</div>",
+            ])
+        else:
+            summary = f"Severity: {issue.get('severity', 'medium')} · {status_label} · Coverage: {coverage_label_text} · Profile priority: {profile_priority}"
+            details_html = "".join([
+                f"<div><b>Profile ordering:</b> {html.escape(profile_priority_line)}</div>",
+                f"<div><b>Locator:</b> {html.escape(str(locator))}</div>",
+                related_face_line,
+                object_line,
+                material_details_html,
+                f"<div><b>Current / threshold:</b> {html.escape(str(threshold_line))}</div>",
+                f"<div><b>Evidence:</b> {html.escape(str(issue.get('evidence', '')))}</div>",
+                f"<div><b>Impact:</b> {html.escape(str(issue.get('impact_en', '')))}</div>",
+                f"<div><b>Fix:</b> {html.escape(str(issue.get('fix_en', '')))}</div>",
+                f"<div><b>Recheck:</b> {html.escape(str(issue.get('recheck_en', '')))}</div>",
+            ])
+        cards.append(
+            f"<details style='background:{background};border-left:5px solid {border};color:#172033;padding:12px 16px;margin:8px 0;border-radius:8px'>"
+            f"<summary style='cursor:pointer;list-style-position:inside'><span style='color:{text};font-size:17px;font-weight:700'>{html.escape(str(title))}</span>"
+            f"<span style='color:#666;margin-left:12px'>{html.escape(str(status_label))}</span></summary>"
+            f"<div style='margin-top:10px'>{html.escape(summary)}</div>{details_html}</details>"
+        )
+    if not cards:
+        label = "已检查通过" if is_zh else "Checked and passed"
+        note = "当前规则覆盖的指标未发现问题。" if is_zh else "No issue was found in the metrics covered by the current rules."
+        cards.append(f"<div style='background:#f6ffed;border-left:5px solid #389e0d;padding:14px 16px;border-radius:8px'><b>{label}</b><div>{note}</div></div>")
+    coverage = selected.get("inspection_coverage", {})
+    coverage_items = []
+    for key, value in coverage.items():
+        label = {"geometry": "几何", "uv": "UV", "materials": "材质", "animation": "动画"}.get(key, key) if is_zh else key.title()
+        state = coverage_label(value)
+        coverage_items.append(f"<li><b>{html.escape(label)}</b>：{html.escape(state)}</li>")
+    coverage_details = selected.get("inspection_coverage_details", {})
+    if coverage_details:
+        detail_items = []
+        for key, detail in coverage_details.items():
+            label = {"geometry": "几何", "uv": "UV", "materials": "材质", "animation": "动画"}.get(key, key) if is_zh else key.title()
+            detail_status = coverage_label(detail.get("status", "not_checked"))
+            observed = detail.get("observed", "—")
+            note = detail.get("note_zh" if is_zh else "note_en", "")
+            detail_items.append(
+                f"<li><b>{html.escape(label)}</b>：{html.escape(str(detail_status))}；"
+                f"<code>{html.escape(str(observed))}</code>；{html.escape(str(note))}</li>"
+            )
+        coverage_items.append(
+            f"<li><b>{'覆盖证据' if is_zh else 'Coverage evidence'}</b><ul>{''.join(detail_items)}</ul></li>"
+        )
+    overlay_available = bool(result.get("metadata", {}).get("issue_overlay_available"))
+    related_counts = result.get("metadata", {}).get("issue_related_face_counts", {})
+    overlay_legend = {
+        "degenerate_faces": ("#f20f0f", "退化面", "Degenerate faces"),
+        "hole": ("#f21f05", "开放边界 / 孔洞关联面", "Hole / boundary-related faces"),
+        "stretched_triangles": ("#ff7305", "拉伸三角形", "Stretched triangles"),
+        "uv_overlap": ("#0d52ff", "UV 重叠面", "UV-overlap faces"),
+        "flipped_normals": ("#9e1ff2", "法线异常面", "Flipped-normal faces"),
+        "non_manifold": ("#ffcf05", "非流形关联面", "Non-manifold faces"),
+    }
+    if overlay_available:
+        legend_items = []
+        for code, (color, label_zh, label_en) in overlay_legend.items():
+            count = int(related_counts.get(code, 0) or 0)
+            if count <= 0:
+                continue
+            label = label_zh if is_zh else label_en
+            legend_items.append(
+                f"<li><span style='display:inline-block;width:11px;height:11px;background:{color};border-radius:2px;margin-right:6px'></span>"
+                f"{html.escape(label)}：{count}</li>"
+            )
+        if legend_items:
+            coverage_items.append(
+                f"<li><b>{'3D Overlay 图例（数量为关联面数）' if is_zh else '3D overlay legend (counts are related faces)'}</b>"
+                f"<ul>{''.join(legend_items)}</ul></li>"
+            )
+    if coverage_items:
+        detail_title = "检测覆盖状态" if is_zh else "Inspection coverage"
+        if info_issues:
+            info_title = "信息提醒" if is_zh else "Information notes"
+            info_items = "".join(
+                f"<li><b>{html.escape(str(item.get('title_zh' if is_zh else 'title_en', item.get('issue_id', 'info'))))}</b>："
+                f"{html.escape(str(item.get('impact_zh' if is_zh else 'impact_en', '')))}"
+                f"<br><code>{html.escape(str(item.get('evidence', '')))}</code></li>"
+                for item in info_issues
+            )
+            coverage_items.append(f"<li><b>{info_title}</b><ul>{info_items}</ul></li>")
+        cards.append(f"<details style='margin:12px 0'><summary style='cursor:pointer;font-weight:700'>{detail_title}</summary><ul>{''.join(coverage_items)}</ul></details>")
+    return "<div><style>details div{margin:7px 0} details summary::marker{color:#666}</style>" + "".join(cards) + "</div>"
+
+
+def render_issue_cards(result: dict[str, Any], language: str) -> str:
+    """Render one compact card per problem; threshold evidence is nested in that card."""
+    selected = result["selected_result"]
+    if "issues" in selected:
+        return _render_canonical_issue_cards(result, language)
+    is_zh = language == "中文"
+    details = [dict(item) for item in selected.get("issue_details", [])]
+    warnings = selected.get("warnings", [])
+    sections = selected.get("inspection_sections", [])
+    confidence = selected.get("confidence_report", {})
+    cards = []
+    palette = {
+        "red": ("#fff1f0", "#cf1322", "#a8071a"),
+        "orange": ("#fff7e6", "#d46b08", "#ad4e00"),
+        "blue": ("#e6f4ff", "#1677ff", "#0958d9"),
+        "green": ("#f6ffed", "#389e0d", "#237804"),
+    }
+
+    severity_zh = {"none": "无", "low": "低", "medium": "中", "high": "高"}
+    threshold_map = {
+        "uv_overlap": "uv_overlap_ratio",
+        "stretched_triangles": "triangle_aspect_p95",
+        "face_budget_exceeded": "triangle_count",
+        "pbr_channel_wiring": "pbr_channel_issue_count",
+    }
+    checks = {check.get("metric"): check for check in confidence.get("checks", [])}
+
+    def threshold_text(check):
+        if not check:
+            return None
+        return (
+            f"当前值 {check.get('current')}{check.get('unit', '')}；"
+            f"阈值 {check.get('threshold')}{check.get('unit', '')}；"
+            f"{check.get('confidence', 'high')} confidence"
+        )
+
+    def add_card(color, title, subtitle, summary, details_html=""):
+        background, border, text = palette[color]
+        cards.append(
+            f"<details style='background:{background};border-left:5px solid {border};color:#172033;padding:12px 16px;margin:8px 0;border-radius:8px'>"
+            f"<summary style='cursor:pointer;list-style-position:inside'><span style='color:{text};font-size:17px;font-weight:700'>{html.escape(title)}</span>"
+            f"<span style='color:#666;margin-left:12px'>{html.escape(subtitle)}</span></summary>"
+            f"<div style='margin-top:10px'>{html.escape(summary)}</div>{details_html}</details>"
+        )
+
+    for detail in details:
+        blocking = detail.get("defect_type") in {"hole", "non_manifold", "degenerate_faces", "uv_overlap"}
+        severity = detail.get("severity", selected.get("severity", "medium"))
+        check = checks.get(threshold_map.get(detail.get("defect_type")))
+        threshold_row = threshold_text(check)
+        if is_zh:
+            summary = f"严重度：{severity_zh.get(severity, severity)} · {'阻断发布' if blocking else '需要关注'}"
+            details_html = "".join([
+                f"<div><b>证据：</b>{html.escape(str(detail.get('evidence', '')))}</div>",
+                f"<div><b>影响：</b>{html.escape(str(detail.get('impact_zh', '')))}</div>",
+                f"<div><b>建议：</b>{html.escape(str(detail.get('repair_zh', '')))}</div>",
+                f"<div><b>复检：</b>{html.escape(str(detail.get('recheck_zh', '')))}</div>",
+                f"<div><b>阈值：</b>{html.escape(threshold_row)}</div>" if threshold_row else "",
+            ])
+            add_card("red" if blocking else "orange", detail.get("title_zh", detail.get("defect_type", "问题")), "阻断问题" if blocking else "需要关注", summary, details_html)
+        else:
+            summary = f"Severity: {severity} · {'Blocking release' if blocking else 'Needs attention'}"
+            details_html = "".join([
+                f"<div><b>Evidence:</b> {html.escape(str(detail.get('evidence', '')))}</div>",
+                f"<div><b>Impact:</b> {html.escape(str(detail.get('impact_en', '')))}</div>",
+                f"<div><b>Recommendation:</b> {html.escape(str(detail.get('repair_en', '')))}</div>",
+                f"<div><b>Recheck:</b> {html.escape(str(detail.get('recheck_en', '')))}</div>",
+                f"<div><b>Threshold:</b> {html.escape(threshold_row)}</div>" if threshold_row else "",
+            ])
+            add_card("red" if blocking else "orange", detail.get("title_en", detail.get("defect_type", "Issue")), "Blocking issue" if blocking else "Needs attention", summary, details_html)
+
+    # Non-defect threshold failures become a problem card instead of a second threshold module.
+    linked_metrics = set(threshold_map.values())
+    for check in confidence.get("checks", []):
+        if check.get("status") not in {"fail", "near_threshold"} or check.get("metric") in linked_metrics:
+            continue
+        blocking = check.get("metric") == "triangle_count" and check.get("status") == "fail"
+        if is_zh:
+            add_card("red" if blocking else "orange", "面数预算" if blocking else "接近阈值", "阻断发布" if blocking else "需要关注", threshold_text(check) or "", f"<div><b>说明：</b>{html.escape(str(check.get('note_zh', '')))}</div>")
+        else:
+            add_card("red" if blocking else "orange", "Face budget" if blocking else "Near threshold", "Blocking release" if blocking else "Needs attention", threshold_text(check) or "", f"<div><b>Note:</b> {html.escape(str(check.get('note_en', '')))}</div>")
+
+    # PBR is an actionable problem, but not a duplicate geometry defect card.
+    pbr_warning = next((item for item in warnings if item.get("code") == "pbr_channel_wiring"), None)
+    if pbr_warning:
+        pbr_check = checks.get("pbr_channel_issue_count")
+        if is_zh:
+            add_card("orange", "PBR 材质通道", "需要关注", "材质连接或颜色空间存在风险", "".join([
+                f"<div><b>证据：</b>{html.escape(str(pbr_warning.get('evidence', '')))}</div>",
+                f"<div><b>建议：</b>{html.escape(str(pbr_warning.get('suggestion_zh', '')))}</div>",
+                f"<div><b>阈值：</b>{html.escape(threshold_text(pbr_check))}</div>" if pbr_check else "",
+            ]))
+        else:
+            add_card("orange", "PBR material wiring", "Needs attention", "Material connections or color spaces may be invalid", "".join([
+                f"<div><b>Evidence:</b> {html.escape(str(pbr_warning.get('evidence', '')))}</div>",
+                f"<div><b>Recommendation:</b> {html.escape(str(pbr_warning.get('suggestion_en', '')))}</div>",
+                f"<div><b>Threshold:</b> {html.escape(threshold_text(pbr_check))}</div>" if pbr_check else "",
+            ]))
+
+    detail_warnings = [item for item in warnings if item.get("code") != "pbr_channel_wiring"]
+    detail_lines = []
+    for section in sections:
+        if section.get("key") not in {"component_split"}:
+            continue
+        status = section.get("status_zh" if is_zh else "status_en", section.get("status", ""))
+        title = section.get("title_zh" if is_zh else "title_en", section.get("key", "detail"))
+        summary = section.get("summary_zh" if is_zh else "summary_en", "")
+        detail_lines.append(f"<li><b>{html.escape(str(title))}</b> · {html.escape(str(status))}：{html.escape(str(summary))}</li>")
+    for warning in detail_warnings:
+        title = warning.get("code", "warning")
+        message = warning.get("message_zh" if is_zh else "message_en", "")
+        detail_lines.append(f"<li><b>{html.escape(str(title))}</b>：{html.escape(str(message))}</li>")
+    if detail_lines:
+        title = "工程详情（结构 / 性能 / 动画）" if is_zh else "Engineering details (structure / performance / animation)"
+        cards.append(f"<details style='margin:12px 0'><summary style='cursor:pointer;font-weight:700'>{title}</summary><ul>{''.join(detail_lines)}</ul></details>")
+    if not cards:
+        add_card("green", "通过" if is_zh else "Passed", "未发现当前规则覆盖的阻断问题" if is_zh else "No blocking issue covered by current rules", "仍建议在目标引擎检查材质、动画和碰撞" if is_zh else "Still validate materials, animation, and collision in the target engine")
+    return "<div><style>details div{margin:7px 0} details summary::marker{color:#666}</style>" + "".join(cards) + "</div>"
+
+
+def build_release_decision(result: dict[str, Any], language: str) -> dict[str, str]:
+    selected = result["selected_result"]
+    health = selected.get("health_score", {})
+    disposition = health.get("disposition")
+    if disposition == "block_and_retry" or selected.get("quality") == "fail" and any(item in {"hole", "non_manifold", "degenerate_faces", "uv_overlap"} for item in selected.get("defect_types", [])):
+        code, zh, en, color = "block_and_retry", "阻断发布 · 建议自动重试", "BLOCK RELEASE · RETRY", "#cf1322"
+    elif result.get("review_required") or disposition == "review_before_release":
+        code, zh, en, color = "review_before_release", "需要人工复核", "HUMAN REVIEW REQUIRED", "#d46b08"
+    elif selected.get("quality") == "pass":
+        code, zh, en, color = "publish", "可发布", "READY TO PUBLISH", "#389e0d"
+    else:
+        code, zh, en, color = "block", "阻断发布", "BLOCK RELEASE", "#cf1322"
+    label = zh if language == "中文" else en
+    return {"code": code, "label": label, "label_zh": zh, "label_en": en, "color": color}
+
+
+def render_release_decision(result: dict[str, Any], language: str) -> str:
+    decision = build_release_decision(result, language)
+    selected = result["selected_result"]
+    health = selected.get("health_score", {})
+    score = f"{health.get('score', '—')}/100 · {health.get('grade', '—')}"
+    profile_score = health.get("profile_fit_score", "—")
+    profile_name = _profile_label(str(health.get("asset_profile", "")), language)
+    profile_confidence = health.get("profile_fit_confidence", "—")
+    profile_coverage = health.get("profile_fit_coverage")
+    coverage_text = f"{profile_coverage * 100:.1f}%" if isinstance(profile_coverage, (int, float)) else "—"
+    profile_line = (
+        f"档案适配分 / Profile fit: {profile_score if profile_score is not None else '—'}/100 · {html.escape(profile_name)}<br>"
+        f"分项 / Components: {html.escape(_profile_component_text(health, language))}<br>"
+        f"覆盖度 / Coverage: {coverage_text} · {html.escape(str(profile_confidence))}<br>"
+        f"排除项 / Excluded: {html.escape(_profile_excluded_text(health, language))}<br>"
+        f"首要风险 / Top risk: {html.escape(_profile_risk_text(health, language))}"
+    )
+    action = {
+        "block_and_retry": "修复后自动重试" if language == "中文" else "Repair, then retry",
+        "review_before_release": "人工复核后再发布" if language == "中文" else "Review before release",
+        "pass_hard_checks": "硬指标通过" if language == "中文" else "Hard checks passed",
+    }.get(health.get("disposition"), "")
+    return (
+        f"<div style='border:2px solid {decision['color']};border-radius:10px;padding:14px 18px;margin:8px 0;display:flex;justify-content:space-between;align-items:center;gap:16px'>"
+        f"<div><button disabled style='border:0;border-radius:6px;padding:8px 14px;background:{decision['color']};color:white;font-size:17px;font-weight:700'>{html.escape(decision['label'])}</button>"
+        f"<span style='margin-left:12px;font-size:20px;font-weight:700'>{html.escape(score)}</span></div>"
+        f"<div style='font-size:14px;color:#666;text-align:right'>{html.escape(action)}<br><span style='font-size:12px'>{profile_line}<br>置信度 / Confidence: {html.escape(str(selected.get('confidence_report', {}).get('overall_confidence', '—')))}</span></div></div>"
+    )
+
+
+def build_comparison(previous: dict[str, Any] | None, current: dict[str, Any], language: str) -> str:
+    """Compare the current inspection with the previous run for this asset slot."""
+    if not previous:
+        title = "结果对比" if language == "中文" else "Result comparison"
+        note = "暂无上一次检测结果；下一次检测会显示修复前后或不同配置的变化。" if language == "中文" else "No previous inspection is available; the next run will show repair, model, or budget changes."
+        return f"<details style='margin:12px 0'><summary style='cursor:pointer;font-weight:700'>{title}</summary><p>{note}</p></details>"
+    prev_selected = previous.get("selected_result", {})
+    curr_selected = current.get("selected_result", {})
+    prev_meta = previous.get("metadata", {})
+    curr_meta = current.get("metadata", {})
+    def valid_uv_ratio(metadata):
+        analyzed = int(metadata.get("uv_analysis_analyzed_triangle_count", 0) or 0)
+        valid = int(metadata.get("uv_valid_triangle_count", 0) or 0)
+        return valid / analyzed if analyzed else None
+    metrics = [
+        ("健康度" if language == "中文" else "Health score", prev_selected.get("health_score", {}).get("score", "—"), curr_selected.get("health_score", {}).get("score", "—"), "", "higher"),
+        ("三角形数" if language == "中文" else "Triangles", prev_meta.get("triangle_count", prev_meta.get("face_count", "—")), curr_meta.get("triangle_count", curr_meta.get("face_count", "—")), "", "lower"),
+        ("UV 重叠" if language == "中文" else "UV overlap", prev_meta.get("uv_overlap_ratio", "—"), curr_meta.get("uv_overlap_ratio", "—"), "ratio", "lower"),
+        ("有效 UV 比例" if language == "中文" else "Valid UV ratio", valid_uv_ratio(prev_meta), valid_uv_ratio(curr_meta), "ratio", "higher"),
+        ("PBR 问题" if language == "中文" else "PBR issues", prev_meta.get("pbr_channel_issue_count", "—"), curr_meta.get("pbr_channel_issue_count", "—"), "", "lower"),
+        ("缺失贴图" if language == "中文" else "Missing textures", prev_meta.get("missing_texture_count", "—"), curr_meta.get("missing_texture_count", "—"), "", "lower"),
+        ("纹理内存" if language == "中文" else "Texture memory", prev_meta.get("estimated_texture_memory_bytes", "—"), curr_meta.get("estimated_texture_memory_bytes", "—"), "bytes", "lower"),
+        ("采样重叠对" if language == "中文" else "Sampled overlap pairs", prev_meta.get("deformation_self_intersection_pair_count", "—"), curr_meta.get("deformation_self_intersection_pair_count", "—"), "", "lower"),
+    ]
+    rows = []
+    for label, before, after, unit, direction in metrics:
+        raw_before, raw_after = before, after
+        if before is None:
+            before = "—"
+        if after is None:
+            after = "—"
+        if unit == "ratio" and isinstance(before, (int, float)) and isinstance(after, (int, float)):
+            before, after = f"{before * 100:.3f}%", f"{after * 100:.3f}%"
+        elif unit == "bytes":
+            before, after = _format_bytes(before), _format_bytes(after)
+        delta_text = "—"
+        delta_color = "#666"
+        if isinstance(raw_before, (int, float)) and isinstance(raw_after, (int, float)):
+            delta = raw_after - raw_before
+            if unit == "ratio":
+                delta_text = f"{delta * 100:+.3f}%"
+            elif unit == "bytes":
+                delta_text = _format_bytes(delta) if delta else "0 B"
+            else:
+                delta_text = f"{delta:+g}"
+            improved = delta > 0 if direction == "higher" else delta < 0
+            delta_color = "#237804" if improved else "#a8071a" if delta else "#666"
+        rows.append(
+            f"<tr><td>{html.escape(label)}</td><td>{html.escape(str(before))}</td><td>→</td><td>{html.escape(str(after))}</td>"
+            f"<td style='color:{delta_color};font-weight:600'>{html.escape(delta_text)}</td></tr>"
+        )
+    prev_decision = build_release_decision(previous, language)["label"]
+    curr_decision = build_release_decision(current, language)["label"]
+    def issue_keys(selected):
+        return {
+            item.get("issue_id"): item.get("title_zh" if language == "中文" else "title_en", item.get("issue_id"))
+            for item in selected.get("issues", [])
+            if item.get("status") != "info"
+        }
+    previous_issues = issue_keys(prev_selected)
+    current_issues = issue_keys(curr_selected)
+    resolved = [previous_issues[key] for key in previous_issues.keys() - current_issues.keys()]
+    new_issues = [current_issues[key] for key in current_issues.keys() - previous_issues.keys()]
+    if language == "中文":
+        issue_change = f"已解决：{'、'.join(resolved) if resolved else '无'}；新增：{'、'.join(new_issues) if new_issues else '无'}。"
+        headers = ("指标", "上一次", "", "本次", "变化")
+    else:
+        issue_change = f"Resolved: {', '.join(resolved) if resolved else 'none'}; new: {', '.join(new_issues) if new_issues else 'none'}."
+        headers = ("Metric", "Previous", "", "Current", "Change")
+    title = "结果对比" if language == "中文" else "Result comparison"
+    return f"<details style='margin:12px 0'><summary style='cursor:pointer;font-weight:700'>{title}</summary><p>{html.escape(prev_decision)} → {html.escape(curr_decision)}</p><p>{html.escape(issue_change)}</p><table style='width:100%;border-collapse:collapse'><thead><tr><th style='text-align:left'>{headers[0]}</th><th>{headers[1]}</th><th>{headers[2]}</th><th>{headers[3]}</th><th>{headers[4]}</th></tr></thead><tbody>{''.join(rows)}</tbody></table></details>"
+
+
+def summarize_feedback(result: dict[str, Any], language: str) -> str:
+    """Render the structured inspection result as a concise operator summary."""
+    selected = result["selected_result"]
+    is_zh = language == "中文"
+    defect_labels = DEFECT_LABELS_ZH if is_zh else DEFECT_LABELS_EN
+    defects = selected.get("defect_types", [])
+    defect_text = "、".join(defect_labels.get(item, item) for item in defects) if is_zh else ", ".join(defect_labels.get(item, item) for item in defects)
+    defect_text = defect_text or ("无" if is_zh else "None")
+    repairs = selected.get("repair_plan", [])
+    if is_zh:
+        repair_items = [REPAIR_LABELS_ZH.get(item, item) for item in defects] or repairs
+        repair_text = "；".join(repair_items)
+    else:
+        repair_text = "; ".join(repairs)
+    review_text = ("需要人工复核" if result["review_required"] else "无需人工复核") if is_zh else ("Human review required" if result["review_required"] else "No human review required")
+    details = selected.get("issue_details", [])
+    warnings = selected.get("warnings", [])
+    sections = selected.get("inspection_sections", [])
+    health = selected.get("health_score", {})
+    disposition = health.get("disposition", "unknown")
+    disposition_zh = {"block_and_retry": "阻断发布，修复后自动重试", "review_before_release": "先人工复核，再决定是否发布", "pass_hard_checks": "硬指标通过，可进入软评估"}.get(disposition, "未配置")
+    disposition_en = {"block_and_retry": "Block release and retry after repair", "review_before_release": "Review before release", "pass_hard_checks": "Hard checks passed; continue to soft evaluation"}.get(disposition, "Not configured")
+    soft = health.get("soft_evaluation", {})
+    readiness = selected.get("asset_readiness", build_asset_readiness(result.get("metadata", {})))
+    confidence = selected.get("confidence_report", {})
+    texture_memory = _format_bytes(readiness.get("estimated_texture_memory_bytes"))
+    asset_file_size = _format_bytes(readiness.get("asset_file_size_bytes"))
+    soft_zh = {
+        "not_available": "尚未执行：" + soft.get("reason_zh", "需要参考图或文本提示"),
+        "inputs_ready": "已收集输入，但当前规则模式未生成软评估分数。",
+        "vlm_assisted": "已将参考图/提示词交给 VLM；健康度数值仍只代表硬指标。",
+    }.get(soft.get("status"), soft.get("status", "未知"))
+    soft_en = {
+        "not_available": "Not run: " + soft.get("reason_en", "a reference image or text prompt is required"),
+        "inputs_ready": "Inputs are ready, but rule mode did not produce a soft score.",
+        "vlm_assisted": "The reference image/prompt was passed to VLM; the numeric health score remains hard-metric-only.",
+    }.get(soft.get("status"), soft.get("status", "unknown"))
+    status = "未通过" if selected.get("quality") == "fail" else "通过"
+    severity = {"none": "无", "low": "低", "medium": "中", "high": "高"}.get(selected.get("severity"), selected.get("severity", "未知"))
+    if not is_zh:
+        status = "FAIL" if selected.get("quality") == "fail" else "PASS"
+        severity = selected.get("severity", "unknown")
+    if is_zh:
+        blocks = [
+            f"### 健康度：{health.get('score', '—')}/100（{health.get('grade', '—')}）\n"
+            f"- **评分依据：** {('硬指标' if health.get('score_basis') == 'hard_metrics_only' else health.get('score_basis', '未知'))}\n"
+            f"- **自动处置建议：** {disposition_zh}\n"
+            f"- **软评估状态：** {soft_zh}\n"
+            f"- **规则置信度：** {confidence.get('overall_confidence', '—')}（{confidence.get('explanation_zh', '')}）",
+            f"### 工程就绪度\n- **材质质量：** {readiness.get('material_grade', '—')}（{readiness.get('material_score', '—')}/100）\n- **文件体积：** {asset_file_size}\n- **加载风险：** {readiness.get('loading_risk', '—')}\n- **预计纹理内存：** {texture_memory}\n- **预计加载时间：** {readiness.get('estimated_load_time_seconds', '—')} 秒；预计 Draw Call：{readiness.get('estimated_draw_calls', '—')}\n- **动画/蒙皮：** {readiness.get('animation_grade', '—')}（{readiness.get('animation_playability', '—')}）",
+            "### 检查反馈\n"
+            f"- **结论：** {status}\n"
+            f"- **发现的问题：** {defect_text}\n"
+            f"- **严重程度：** {severity}\n"
+            f"- **修复建议：** {repair_text or '无'}\n"
+            f"- **审核状态：** {review_text}"
+        ]
+        for section in sections:
+            blocks.append(
+                f"#### {section.get('title_zh', section.get('key', '检测分区'))} · {section.get('status_zh', '')}\n"
+                f"- **检查证据：** `{section.get('evidence', '')}`\n"
+                f"- **结果说明：** {section.get('summary_zh', '')}\n"
+                f"- **建议：** {section.get('suggestion_zh', '')}"
+            )
+        for check in confidence.get("checks", []):
+            status = {"fail": "未通过", "near_threshold": "接近阈值", "pass": "通过"}.get(check.get("status"), check.get("status", "未知"))
+            blocks.append(
+                f"#### 阈值解释 · {check.get('metric', 'metric')} · {status}\n"
+                f"- **当前值：** `{check.get('current')}{check.get('unit', '')}`\n"
+                f"- **规则阈值：** `{check.get('threshold')}{check.get('unit', '')}`\n"
+                f"- **置信度：** {check.get('confidence', '—')}\n"
+                f"- **说明：** {check.get('note_zh', '')}"
+            )
+        for detail in details:
+            blocks.append(
+                f"#### {detail.get('title_zh', detail.get('defect_type', '问题'))}\n"
+                f"- **检查证据：** `{detail.get('evidence', '')}`\n"
+                f"- **问题说明：** {detail.get('what_zh', '')}\n"
+                f"- **潜在影响：** {detail.get('impact_zh', '')}\n"
+                f"- **建议处理：** {detail.get('repair_zh', '')}\n"
+                f"- **复检标准：** {detail.get('recheck_zh', '')}"
+            )
+        for warning in warnings:
+            blocks.append(
+                f"#### 结构检查提醒（{warning.get('code', 'warning')}）\n"
+                f"- **证据：** `{warning.get('evidence', '')}`\n"
+                f"- **说明：** {warning.get('message_zh', '')}\n"
+                f"- **建议：** {warning.get('suggestion_zh', '')}"
+            )
+        if not details:
+            blocks.append("#### 结论说明\n未发现当前规则覆盖的主要几何质量问题，仍建议在目标引擎中进行材质、动画和碰撞测试。")
+        return "\n\n".join(blocks)
+    blocks = [
+        f"### Health score: {health.get('score', '—')}/100 ({health.get('grade', '—')})\n"
+        f"- **Basis:** {('hard metrics only' if health.get('score_basis') == 'hard_metrics_only' else health.get('score_basis', 'unknown'))}\n"
+        f"- **Automatic disposition:** {disposition_en}\n"
+        f"- **Soft evaluation:** {soft_en}\n"
+        f"- **Rule confidence:** {confidence.get('overall_confidence', '—')} ({confidence.get('explanation_en', '')})",
+        f"### Delivery readiness\n- **Material quality:** {readiness.get('material_grade', '—')} ({readiness.get('material_score', '—')}/100)\n- **File size:** {asset_file_size}\n- **Loading risk:** {readiness.get('loading_risk', '—')}\n- **Estimated texture memory:** {texture_memory}\n- **Estimated load time:** {readiness.get('estimated_load_time_seconds', '—')} s; estimated draw calls: {readiness.get('estimated_draw_calls', '—')}\n- **Animation/skinning:** {readiness.get('animation_grade', '—')} ({readiness.get('animation_playability', '—')})",
+        "### Inspection feedback\n"
+        f"- **Decision:** {status}\n"
+        f"- **Detected issues:** {defect_text}\n"
+        f"- **Severity:** {severity}\n"
+        f"- **Repair recommendation:** {repair_text or 'None'}\n"
+        f"- **Review status:** {review_text}"
+    ]
+    for section in sections:
+        blocks.append(
+            f"#### {section.get('title_en', section.get('key', 'Inspection section'))} · {section.get('status_en', '')}\n"
+            f"- **Evidence:** `{section.get('evidence', '')}`\n"
+            f"- **Result:** {section.get('summary_en', '')}\n"
+            f"- **Recommendation:** {section.get('suggestion_en', '')}"
+        )
+    for check in confidence.get("checks", []):
+        status = {"fail": "FAIL", "near_threshold": "NEAR THRESHOLD", "pass": "PASS"}.get(check.get("status"), check.get("status", "UNKNOWN"))
+        blocks.append(
+            f"#### Threshold explanation · {check.get('metric', 'metric')} · {status}\n"
+            f"- **Current:** `{check.get('current')}{check.get('unit', '')}`\n"
+            f"- **Threshold:** `{check.get('threshold')}{check.get('unit', '')}`\n"
+            f"- **Confidence:** {check.get('confidence', '—')}\n"
+            f"- **Note:** {check.get('note_en', '')}"
+        )
+    for detail in details:
+        blocks.append(
+            f"#### {detail.get('title_en', detail.get('defect_type', 'Issue'))}\n"
+            f"- **Evidence:** `{detail.get('evidence', '')}`\n"
+            f"- **What it means:** {detail.get('what_en', '')}\n"
+            f"- **Potential impact:** {detail.get('impact_en', '')}\n"
+            f"- **Recommended action:** {detail.get('repair_en', '')}\n"
+            f"- **Recheck:** {detail.get('recheck_en', '')}"
+        )
+    for warning in warnings:
+        blocks.append(
+            f"#### Structural note ({warning.get('code', 'warning')})\n"
+            f"- **Evidence:** `{warning.get('evidence', '')}`\n"
+            f"- **Meaning:** {warning.get('message_en', '')}\n"
+            f"- **Suggestion:** {warning.get('suggestion_en', '')}"
+        )
+    if not details:
+        blocks.append("#### Overall note\nNo major geometry issue covered by the current rules was detected. Still validate materials, animation, and collision behavior in the target engine.")
+    return "\n\n".join(blocks)
 
 
 def _data_uri(path: str | None) -> str:
@@ -288,6 +2333,72 @@ def _data_uri(path: str | None) -> str:
     mime = mimetypes.guess_type(path)[0] or "image/png"
     encoded = base64.b64encode(Path(path).read_bytes()).decode("ascii")
     return f"data:{mime};base64,{encoded}"
+
+
+def summarize_feedback_compact(result: dict[str, Any], language: str) -> str:
+    """Keep the operator summary to one decision line plus unique engineering details."""
+    selected = result["selected_result"]
+    metadata = result.get("metadata", {})
+    is_zh = language == "中文"
+    health = selected.get("health_score", {})
+    decision = build_release_decision(result, language)
+    issues = selected.get("issues", [])
+    problem_names = [item.get("title_zh" if is_zh else "title_en", item.get("issue_id", "issue")) for item in issues if item.get("status") != "info"]
+    if is_zh:
+        problem_text = "、".join(problem_names) if problem_names else "未发现需要立即处理的问题"
+        profile_coverage = health.get("profile_fit_coverage")
+        profile_coverage_text = f"{profile_coverage * 100:.1f}%" if isinstance(profile_coverage, (int, float)) else "—"
+        readiness = build_asset_readiness(metadata)
+        adaptive = metadata.get("runtime_inspection_strategy", {}) or {}
+        geometry_adaptive = adaptive.get("geometry_adaptive", {}) or {}
+        effective_strategy = " + ".join(filter(None, [adaptive.get("strategy"), geometry_adaptive.get("strategy")])) or "default"
+        soft = health.get("soft_evaluation", {})
+        soft_text = {
+            "not_available": "未执行",
+            "inputs_ready": "输入已准备，尚未评分",
+            "vlm_assisted": "已由 VLM 辅助解释",
+        }.get(soft.get("status"), soft.get("status", "未知"))
+        return (
+            f"### 检测总结\n**{html.escape(decision['label'])}** · 健康度 **{health.get('score', '—')}/100（{health.get('grade', '—')}）**。"
+            f"档案适配分 **{health.get('profile_fit_score') if health.get('profile_fit_score') is not None else '—'}/100**（{html.escape(_profile_label(str(health.get('asset_profile', '')), language))}，覆盖度 {profile_coverage_text}，置信度 {health.get('profile_fit_confidence', '—')}）。"
+            f"需要处理：{html.escape(problem_text)}。详细证据、阈值和复检标准见上方问题卡片。\n\n"
+            f"<details><summary>工程详情（结构 / 性能 / 软评估）</summary>\n\n"
+            f"- **差异化评分：** {_profile_component_text(health, language)}；覆盖度 {profile_coverage_text}，置信度 {health.get('profile_fit_confidence', '—')}，排除项 {_profile_excluded_text(health, language)}\n"
+            f"- **评分链路：** {_profile_contribution_text(health, language)}\n"
+            f"- **档案优先风险：** {_profile_risk_text(health, language)}\n"
+            f"- **资产规模：** {metadata.get('triangle_count', metadata.get('face_count', '—'))} 个三角形，{metadata.get('source_mesh_object_count', '—')} 个网格对象，{metadata.get('connected_component_count', '—')} 个连接组件\n"
+            f"- **材质：** {readiness.get('material_grade', '—')}（{readiness.get('material_score', '—')}/100），材质槽 {metadata.get('material_slot_count', '—')}，PBR 问题 {metadata.get('pbr_channel_issue_count', '—')}\n"
+            f"- **运行时：** 文件 {_format_bytes(readiness.get('asset_file_size_bytes'))}，加载风险 {readiness.get('loading_risk', '—')}，预计纹理内存 {_format_bytes(readiness.get('estimated_texture_memory_bytes'))}，Draw Call {readiness.get('estimated_draw_calls', '—')}\n"
+            f"- **检测策略：** {effective_strategy}，预览 {geometry_adaptive.get('effective_views', adaptive.get('preview_views', '—'))} 视图 × {geometry_adaptive.get('effective_resolution', adaptive.get('preview_resolution', '—'))}px，诊断上限 {geometry_adaptive.get('effective_max_diagnostic_triangles', adaptive.get('max_diagnostic_triangles', '—'))} 三角形\n"
+            f"- **UV：** 密度 P05 {metadata.get('uv_density_stats', {}).get('p05', '—')}，拉伸 P95 {metadata.get('uv_stretch_stats', {}).get('p95', '—')}，{'采样分析' if metadata.get('uv_analysis_sampled') or metadata.get('uv_overlap_analysis_sampled') else '完整分析'}\n"
+            f"- **动画 / 蒙皮：** {readiness.get('animation_grade', '—')}（{readiness.get('animation_playability', '—')}）\n"
+            f"- **软评估：** {soft_text}\n\n</details>"
+        )
+    problem_text = ", ".join(problem_names) if problem_names else "No immediate issue detected"
+    profile_coverage = health.get("profile_fit_coverage")
+    profile_coverage_text = f"{profile_coverage * 100:.1f}%" if isinstance(profile_coverage, (int, float)) else "—"
+    readiness = build_asset_readiness(metadata)
+    adaptive = metadata.get("runtime_inspection_strategy", {}) or {}
+    geometry_adaptive = adaptive.get("geometry_adaptive", {}) or {}
+    effective_strategy = " + ".join(filter(None, [adaptive.get("strategy"), geometry_adaptive.get("strategy")])) or "default"
+    soft = health.get("soft_evaluation", {})
+    soft_text = {"not_available": "not run", "inputs_ready": "inputs ready; not scored", "vlm_assisted": "VLM assisted"}.get(soft.get("status"), soft.get("status", "unknown"))
+    return (
+        f"### Inspection summary\n**{html.escape(decision['label'])}** · Health score **{health.get('score', '—')}/100 ({health.get('grade', '—')})**."
+        f" Profile fit **{health.get('profile_fit_score') if health.get('profile_fit_score') is not None else '—'}/100** ({html.escape(_profile_label(str(health.get('asset_profile', '')), language))}, coverage {profile_coverage_text}, confidence {health.get('profile_fit_confidence', '—')})."
+        f" Issues to address: {html.escape(problem_text)}. Detailed evidence, thresholds, and recheck criteria are in the cards above.\n\n"
+        f"<details><summary>Engineering details (structure / performance / soft evaluation)</summary>\n\n"
+        f"- **Differentiated scoring:** {_profile_component_text(health, language)}; coverage {profile_coverage_text}, confidence {health.get('profile_fit_confidence', '—')}, excluded {_profile_excluded_text(health, language)}\n"
+        f"- **Score trace:** {_profile_contribution_text(health, language)}\n"
+        f"- **Top profile risks:** {_profile_risk_text(health, language)}\n"
+        f"- **Asset size:** {metadata.get('triangle_count', metadata.get('face_count', '—'))} triangles, {metadata.get('source_mesh_object_count', '—')} mesh objects, {metadata.get('connected_component_count', '—')} connected components\n"
+        f"- **Materials:** {readiness.get('material_grade', '—')} ({readiness.get('material_score', '—')}/100), {metadata.get('material_slot_count', '—')} slots, {metadata.get('pbr_channel_issue_count', '—')} PBR issues\n"
+        f"- **Runtime:** {_format_bytes(readiness.get('asset_file_size_bytes'))} file, {readiness.get('loading_risk', '—')} loading risk, {_format_bytes(readiness.get('estimated_texture_memory_bytes'))} estimated texture memory, {readiness.get('estimated_draw_calls', '—')} draw calls\n"
+        f"- **Inspection strategy:** {effective_strategy}, {geometry_adaptive.get('effective_views', adaptive.get('preview_views', '—'))} views × {geometry_adaptive.get('effective_resolution', adaptive.get('preview_resolution', '—'))}px, diagnostic limit {geometry_adaptive.get('effective_max_diagnostic_triangles', adaptive.get('max_diagnostic_triangles', '—'))} triangles\n"
+        f"- **UV:** density P05 {metadata.get('uv_density_stats', {}).get('p05', '—')}, stretch P95 {metadata.get('uv_stretch_stats', {}).get('p95', '—')}, {'sampled' if metadata.get('uv_analysis_sampled') or metadata.get('uv_overlap_analysis_sampled') else 'full'} analysis\n"
+        f"- **Animation / skinning:** {readiness.get('animation_grade', '—')} ({readiness.get('animation_playability', '—')})\n"
+        f"- **Soft evaluation:** {soft_text}\n\n</details>"
+    )
 
 
 def write_report(result: dict[str, Any], paths: dict[str, Any]) -> str:
@@ -300,17 +2411,38 @@ def write_report(result: dict[str, Any], paths: dict[str, Any]) -> str:
     )
     diagnostics = "".join(
         f'<div style="display:inline-block;width:48%;vertical-align:top;"><h3>{name}</h3><img src="{_data_uri(path)}" style="max-width:100%;border-radius:8px;"></div>'
-        for name, path in (("UV layout", paths.get("uv")), ("Normal map", paths.get("normal")))
+        for name, path in (("UV layout", paths.get("uv")), ("UV stretch heatmap", paths.get("uv_heatmap")), ("Normal diagnostic", paths.get("normal")))
         if path
     )
-    status = "REVIEW REQUIRED" if result["review_required"] else str(selected.get("quality", "unknown")).upper()
+    overlay_path = paths.get("model_overlay")
+    if overlay_path and Path(overlay_path).exists():
+        overlay_uri = _data_uri(overlay_path)
+        diagnostics += (
+            "<div style='display:inline-block;width:48%;vertical-align:top;'>"
+            "<h3>Issue overlay (3D)</h3>"
+            f"<p>This artifact is a GLB model, not a raster image. "
+            f"<a download='issue_overlay.glb' href='{overlay_uri}'>Download 3D overlay</a> "
+            "and open it in a GLB viewer.</p></div>"
+        )
+    language = result.get("feedback_language", "中文")
+    summary_html = render_release_decision(result, language)
+    issue_html = render_issue_cards(result, language)
+    comparison_html = result.get("comparison", "")
+    structured = {
+        "selected_result": {key: selected.get(key) for key in ("quality", "defect_types", "severity", "repair_plan", "asset_profile", "health_score", "asset_readiness", "inspection_coverage", "inspection_coverage_details", "issues")},
+        "metadata": result.get("metadata", {}),
+        "mode": result.get("mode"),
+        "selected_source": result.get("selected_source"),
+        "review_required": result.get("review_required"),
+    }
+    problems_title = "问题卡片" if language == "中文" else "Problems"
     body = f"""<!doctype html><html><head><meta charset='utf-8'><title>3D Quality Report</title>
-    <style>body{{font-family:Arial,sans-serif;max-width:1100px;margin:32px auto;padding:0 20px;color:#172033}} .status{{font-size:26px;font-weight:700;padding:18px;border-radius:10px;background:#fff3cd}} pre{{background:#f4f6f8;padding:16px;border-radius:8px;overflow:auto}} </style></head>
+    <style>body{{font-family:Arial,sans-serif;max-width:1100px;margin:32px auto;padding:0 20px;color:#172033}} pre{{background:#f4f6f8;padding:16px;border-radius:8px;overflow:auto;white-space:pre-wrap}} table{{border-collapse:collapse;width:100%}} th,td{{border-bottom:1px solid #e5e7eb;padding:8px;text-align:left}} summary{{cursor:pointer}} </style></head>
     <body><h1>3D Asset Multimodal Quality Report</h1><p><b>Asset:</b> {html.escape(str(result['asset_id']))} &nbsp; <b>Mode:</b> {html.escape(result['mode'])}</p>
-    <div class='status'>{html.escape(status)}</div><h2>Selected diagnosis</h2><pre>{html.escape(json.dumps(selected, ensure_ascii=False, indent=2))}</pre>
+    <h2>{'决策摘要' if language == '中文' else 'Decision summary'}</h2>{summary_html}<h2>{problems_title}</h2>{issue_html}{comparison_html}
     <h2>Multi-view evidence</h2><div>{cards}</div><h2>Diagnostic evidence</h2><div>{diagnostics}</div>
-    <h2>System details</h2><pre>{html.escape(json.dumps({k:v for k,v in result.items() if k not in {'selected_result','rule_result','vlm_result','metadata'}}, ensure_ascii=False, indent=2))}</pre>
-    <h2>Structured metadata</h2><pre>{html.escape(json.dumps(result['metadata'], ensure_ascii=False, indent=2))}</pre></body></html>"""
+    <details style='margin-top:20px'><summary><b>Structured audit data</b></summary><pre>{html.escape(json.dumps(structured, ensure_ascii=False, indent=2))}</pre></details>
+    </body></html>"""
     report_path.write_text(body, encoding="utf-8")
     return str(report_path)
 
@@ -323,6 +2455,7 @@ def make_app():
     sample_ids = sample_ids or [row["id"] for row in rows]
     initial = indexed[sample_ids[0]]
     initial_paths = resolve_image_paths(initial, Path(manifest_default))
+    inspection_history: dict[str, dict[str, Any]] = {}
 
     def preview(sample_id: str, manifest_text: str):
         manifest = Path(manifest_text).expanduser()
@@ -331,28 +2464,64 @@ def make_app():
         paths = resolve_image_paths(row, manifest)
         metadata = compact_metadata(row.get("metadata", {}))
         info = {"id": row["id"], "scene_id": row.get("scene_id"), "split": row.get("split"), "generalization": row.get("generalization"), "question_type": row.get("question_type"), "question": row.get("question"), "metadata": metadata}
-        return paths["views"], paths["uv"], paths["normal"], info
+        return paths["views"], paths["uv"], paths["uv_heatmap"], paths["normal"], paths["model"], paths["model_overlay"], info
 
-    def inspect(sample_id: str, manifest_text: str, mode: str, condition: str, model_id: str,
-                adapter_text: str, max_new_tokens: int, min_pixels: int, max_pixels: int, offload_text: str):
+    def inspect(sample_id: str, manifest_text: str, mode: str, feedback_language: str, asset_profile: str, target_face_budget: str, threshold_text: str,
+                reference_image: str | None, generation_prompt: str, condition: str, model_id: str,
+                adapter_text: str, max_new_tokens: int, min_pixels: int, max_pixels: int, offload_text: str,
+                progress: Any = _DEFAULT_PROGRESS):
         manifest = Path(manifest_text).expanduser()
         _, current_indexed = load_rows(manifest)
         if sample_id not in current_indexed:
             raise ValueError(f"Unknown sample id: {sample_id}")
-        result, paths = build_result(current_indexed[sample_id], manifest, mode, condition, model_id, adapter_text, max_new_tokens, min_pixels, max_pixels, offload_text)
+        _progress_update(progress, 0.08, "读取上传资产和配置")
+        try:
+            _progress_update(progress, 0.25, "规则统计阶段")
+            if mode in {"VLM diagnosis", "Hybrid review"}:
+                _progress_update(progress, 0.45, "VLM 阶段")
+            result, paths = build_result(
+                current_indexed[sample_id], manifest, mode, condition, model_id, adapter_text,
+                max_new_tokens, min_pixels, max_pixels, offload_text, target_face_budget,
+                reference_image, generation_prompt, load_thresholds(resolve_threshold_path(threshold_text)), asset_profile,
+            )
+            if mode in {"VLM diagnosis", "Hybrid review"}:
+                _progress_update(progress, 0.72, "VLM 阶段")
+            _progress_update(progress, 0.86, "报告生成阶段")
+        except Exception as exc:
+            log_path = manifest.parent / "inspection.log"
+            log_path.write_text(f"{type(exc).__name__}: {exc}\n", encoding="utf-8")
+            raise RuntimeError(f"Inspection failed. Error log: {log_path}") from exc
+        result["feedback_language"] = feedback_language
+        previous = inspection_history.get(sample_id)
+        result["comparison"] = build_comparison(previous, result, feedback_language)
         report = write_report(result, paths)
+        _progress_update(progress, 1.0, "检测任务完成")
         selected = result["selected_result"]
+        decision = build_release_decision(result, feedback_language)
+        inspection_history[sample_id] = result
         summary = {
             "status": "REVIEW REQUIRED" if result["review_required"] else selected.get("quality", "unknown").upper(),
             "defect_types": selected.get("defect_types", []),
             "severity": selected.get("severity", "unknown"),
             "repair_plan": selected.get("repair_plan", []),
+            "issue_details": selected.get("issue_details", []),
+            "issues": selected.get("issues", []),
+            "warnings": selected.get("warnings", []),
+            "inspection_coverage": selected.get("inspection_coverage", {}),
+            "inspection_coverage_details": selected.get("inspection_coverage_details", {}),
+            "inspection_sections": selected.get("inspection_sections", []),
+            "asset_readiness": selected.get("asset_readiness", {}),
+            "confidence_report": selected.get("confidence_report", {}),
+            "release_decision": decision,
+            "comparison_available": previous is not None,
+            "health_score": selected.get("health_score", {}),
+            "asset_profile": selected.get("asset_profile", "Auto"),
             "selected_source": result["selected_source"],
             "agreement_score": result["agreement_score"],
             "review_required": result["review_required"],
             "disagreement_reasons": result["disagreement_reasons"],
         }
-        return summary, result, report
+        return summary, render_issue_cards(result, feedback_language), render_release_decision(result, feedback_language), result["comparison"], summarize_feedback_compact(result, feedback_language), result, report
 
     with gr.Blocks(title="3D Asset Multimodal Quality Inspector", theme=gr.themes.Soft()) as demo:
         gr.Markdown("# 3D Asset Multimodal Quality Inspector\n研究型工业质检原型：规则检测负责可靠性，VLM 负责多模态解释与修复建议。")
@@ -360,11 +2529,34 @@ def make_app():
             with gr.Column(scale=1):
                 manifest = gr.Textbox(value=manifest_default, label="Manifest path")
                 blender_path = gr.Textbox(value=find_blender(), label="Blender executable")
-                asset_upload = gr.File(label="Upload .blend asset", file_types=[".blend"], type="filepath")
+                threshold_config = gr.Textbox(value=str(DEFAULT_THRESHOLDS), label="Threshold config (JSON)")
+                with gr.Accordion("Generate a test asset", open=True):
+                    gr.Markdown("生成一个可复现的 Blender 测试资产，并自动进入同一套证据与反馈流程。")
+                    generated_family = gr.Dropdown(
+                        ["ico_sphere", "cube", "cylinder", "cone", "torus"],
+                        value="torus",
+                        label="Asset family",
+                    )
+                    generated_defect = gr.Dropdown(
+                        ["uv_overlap", "non_manifold", "flipped_normals", "hole", "stretched_triangles", "degenerate_faces"],
+                        value="uv_overlap",
+                        label="Injected defect",
+                    )
+                    generate_button = gr.Button("Generate and prepare", variant="secondary")
+                asset_upload = gr.File(label="Upload .blend / .fbx / .obj asset", file_types=[".blend", ".fbx", ".obj"], type="filepath")
                 prepare_button = gr.Button("Prepare uploaded asset", variant="secondary")
-                upload_status = gr.Markdown("Use an existing sample first, or upload a .blend file for runtime inspection.")
+                retry_button = gr.Button("Retry last upload", variant="secondary")
+                repair_button = gr.Button("Auto repair and re-inspect", variant="secondary")
+                cancel_button = gr.Button("Cancel running task", variant="stop")
+                gr.Markdown("修复只作用于运行时副本：合并重复顶点、清理孤立几何、填补孔洞并统一法线，然后重新生成证据。")
+                upload_status = gr.Markdown("Use an existing sample, or upload a .blend / .fbx / .obj file for runtime inspection.")
                 sample = gr.Dropdown(choices=sample_ids, value=sample_ids[0], label="Test asset")
                 mode = gr.Radio(["Rule baseline", "VLM diagnosis", "Hybrid review"], value="Rule baseline", label="Inspection mode")
+                feedback_language = gr.Dropdown(["中文", "English"], value="中文", label="Feedback language")
+                asset_profile = gr.Dropdown(ASSET_PROFILE_CHOICES, value="Auto", label="Asset quality profile")
+                target_face_budget = gr.Dropdown(["Auto", "50k", "1m", "1.5m"], value="Auto", label="Target face budget")
+                reference_image = gr.Image(label="Reference image (optional)", type="filepath")
+                generation_prompt = gr.Textbox(label="Generation prompt (optional)", lines=3, placeholder="例如：商代青铜鼎，饕餮纹，三足，低模可用于实时渲染")
                 condition = gr.Dropdown(["B0", "B1", "B2", "B3", "B4"], value="B4", label="VLM condition")
                 model_id = gr.Textbox(value=DEFAULT_MODEL, label="VLM model")
                 adapter = gr.Textbox(value=str(DEFAULT_ADAPTER), label="LoRA adapter (optional)")
@@ -375,22 +2567,56 @@ def make_app():
                     offload = gr.Textbox(value="offload/demo_inference", label="Offload directory")
                 inspect_button = gr.Button("Run inspection", variant="primary")
             with gr.Column(scale=2):
+                model_preview = gr.Model3D(value=initial_paths["model"], label="Interactive 3D preview", height=420, display_mode="solid")
+                issue_overlay = gr.Model3D(value=initial_paths["model_overlay"], label="Issue overlay preview", height=360, display_mode="solid")
                 views = gr.Gallery(value=initial_paths["views"], label="Multi-view evidence", columns=4, height="auto")
                 with gr.Row():
                     uv = gr.Image(value=initial_paths["uv"], label="UV diagnostic", type="filepath")
+                    uv_heatmap = gr.Image(value=initial_paths["uv_heatmap"], label="UV stretch / density heatmap", type="filepath")
                     normal = gr.Image(value=initial_paths["normal"], label="Normal diagnostic", type="filepath")
-                asset_info = gr.JSON(value={"id": initial["id"], "scene_id": initial.get("scene_id")}, label="Asset information")
+                issue_cards = gr.HTML("运行检查后，这里会显示问题卡片。", label="Issue cards")
+                decision_badge = gr.HTML("运行检查后，这里会显示发布决策。", label="Release decision")
+                comparison = gr.HTML("运行两次检查后，这里会显示结果对比。", label="Result comparison")
+                feedback = gr.Markdown("运行检查后，这里会显示中文或英文总结。", label="Feedback summary")
+                with gr.Accordion("Asset information", open=False):
+                    asset_info = gr.JSON(value={"id": initial["id"], "scene_id": initial.get("scene_id")}, label="Asset information")
         with gr.Row():
-            summary = gr.JSON(label="Inspection result")
-            raw_result = gr.JSON(label="Full result / audit record")
+            with gr.Accordion("Inspection result", open=False):
+                summary = gr.JSON(label="Inspection result")
+            with gr.Accordion("Full result / audit record", open=False):
+                raw_result = gr.JSON(label="Full result / audit record")
         report = gr.File(label="Download HTML report")
-        prepare_button.click(
-            prepare_uploaded_blend,
-            inputs=[asset_upload, blender_path],
-            outputs=[manifest, sample, asset_info, views, uv, normal, upload_status],
+        prepare_event = prepare_button.click(
+                prepare_uploaded_asset,
+            inputs=[asset_upload, blender_path, threshold_config],
+            outputs=[manifest, sample, asset_info, views, uv, uv_heatmap, normal, model_preview, issue_overlay, upload_status],
         )
-        sample.change(preview, inputs=[sample, manifest], outputs=[views, uv, normal, asset_info])
-        inspect_button.click(inspect, inputs=[sample, manifest, mode, condition, model_id, adapter, max_new_tokens, min_pixels, max_pixels, offload], outputs=[summary, raw_result, report])
+        generate_event = generate_button.click(
+            generate_demo_asset,
+            inputs=[blender_path, threshold_config, generated_family, generated_defect],
+            outputs=[manifest, sample, asset_info, views, uv, uv_heatmap, normal, model_preview, issue_overlay, upload_status],
+        )
+        repair_event = repair_button.click(
+            repair_and_reinspect,
+            inputs=[manifest, blender_path, threshold_config],
+            outputs=[manifest, sample, asset_info, views, uv, uv_heatmap, normal, model_preview, issue_overlay, upload_status],
+        )
+        retry_event = retry_button.click(
+            prepare_uploaded_asset,
+            inputs=[asset_upload, blender_path, threshold_config],
+            outputs=[manifest, sample, asset_info, views, uv, uv_heatmap, normal, model_preview, issue_overlay, upload_status],
+        )
+        sample.change(preview, inputs=[sample, manifest], outputs=[views, uv, uv_heatmap, normal, model_preview, issue_overlay, asset_info])
+        inspect_event = inspect_button.click(
+            inspect,
+            inputs=[sample, manifest, mode, feedback_language, asset_profile, target_face_budget, threshold_config, reference_image, generation_prompt, condition, model_id, adapter, max_new_tokens, min_pixels, max_pixels, offload],
+            outputs=[summary, issue_cards, decision_badge, comparison, feedback, raw_result, report],
+        )
+        cancel_button.click(
+            cancel_running_jobs,
+            outputs=[upload_status],
+            cancels=[prepare_event, generate_event, repair_event, retry_event, inspect_event],
+        )
     return demo
 
 

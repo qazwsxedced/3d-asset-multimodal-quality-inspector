@@ -1,0 +1,36 @@
+[
+  {"name": "multi_part_fbx", "format": "fbx", "expected": ["source_mesh_object_count", "component_details"], "assertions": [
+    {"path": "source_mesh_object_count", "op": "gte", "value": 3, "label": "multi-part FBX keeps three source mesh objects"},
+    {"path": "source_object_names", "op": "contains", "value": "Antenna", "label": "object-level localization includes Antenna"}
+  ]},
+  {"name": "rigged_fbx", "format": "fbx", "expected": ["source_armature_count", "animation_action_count", "rigged_mesh_count"], "assertions": [
+    {"path": "source_armature_count", "op": "gte", "value": 1, "label": "armature detected"},
+    {"path": "animation_action_count", "op": "gte", "value": 1, "label": "animation action detected"},
+    {"path": "rigged_mesh_count", "op": "gte", "value": 1, "label": "skinned mesh detected"},
+    {"path": "deformation_self_intersection_check", "op": "eq", "value": "passed_sampled_no_non_adjacent_overlap", "label": "sampled deformation probe completes"}
+  ]},
+  {"name": "textured_fbx", "format": "fbx", "expected": ["material_count", "texture_image_count", "pbr_material_reports"], "assertions": [
+    {"path": "texture_image_count", "op": "gte", "value": 1, "label": "texture image detected"},
+    {"path": "pbr_material_reports.0.material_mode", "op": "eq", "value": "textured", "label": "material classified as textured"}
+  ]},
+  {"name": "multi_material_obj", "format": "obj", "expected": ["material_count", "material_slot_count"], "assertions": [
+    {"path": "material_count", "op": "gte", "value": 2, "label": "multiple materials detected"},
+    {"path": "material_slot_count", "op": "gte", "value": 2, "label": "multiple material slots detected"}
+  ]},
+  {"name": "high_poly_obj", "format": "obj", "expected": ["triangle_count", "estimated_runtime_memory_bytes"], "assertions": [
+    {"path": "triangle_count", "op": "gte", "value": 10000, "label": "high-poly fixture has substantial triangle count"},
+    {"path": "estimated_runtime_memory_bytes", "op": "gt", "value": 0, "label": "runtime memory estimate is present"}
+  ]},
+  {"name": "missing_texture_blend", "format": "blend", "expected": ["missing_texture_count", "pbr_channel_issue_count"], "assertions": [
+    {"path": "missing_texture_count", "op": "gt", "value": 0, "label": "missing texture is detected"},
+    {"path": "texture_images.0.resource_status", "op": "eq", "value": "missing", "label": "texture resource is marked missing"}
+  ]},
+  {"name": "no_uv_obj", "format": "obj", "expected": ["uv_layer_count", "uv_island_count"], "assertions": [
+    {"path": "uv_layer_count", "op": "eq", "value": 0, "label": "no UV layer is detected"},
+    {"path": "uv_island_count", "op": "eq", "value": 0, "label": "no UV islands are reported"}
+  ]},
+  {"name": "multi_lod_fbx", "format": "fbx", "expected": ["source_lod_count", "source_lod_levels"], "assertions": [
+    {"path": "source_lod_count", "op": "gte", "value": 3, "label": "three LOD levels are detected"},
+    {"path": "source_lod_levels", "op": "contains", "value": 2, "label": "highest LOD level is present"}
+  ]}
+]

@@ -1,5 +1,7 @@
 # Multimodal VLM Reasoning with Multi-View Images and Structured Metadata
 
+The standalone asset-inspection subsystem is documented in [3D Asset Multimodal Quality Inspector](docs/3D%20Asset%20Multimodal%20Quality%20Inspector.md).
+
 This repository contains a reproducible research project for multimodal algorithm applications. It studies the following question:
 
 > How do multi-view images, UV/normal diagnostic maps, and low-level structured geometry statistics affect a VLM's ability to diagnose 3D asset quality, separately and in combination?

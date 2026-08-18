@@ -48,25 +48,31 @@ def fit_family_thresholds(rows: list[dict], fit_split: str) -> dict[str, float]:
     return thresholds
 
 
-def infer_defects(metadata: dict, uv_threshold: float, stretch_ratio: float, family_thresholds: dict[str, float] | None = None) -> list[str]:
+def infer_defects(
+    metadata: dict,
+    uv_threshold: float,
+    stretch_ratio: float,
+    family_thresholds: dict[str, float] | None = None,
+    boundary_policy: str = "strict",
+) -> list[str]:
     """Infer defects using only low-level metadata and fixed thresholds."""
     defects = set()
     if metadata.get("non_manifold_edge_count", 0) > 0:
         defects.add("non_manifold")
-    if metadata.get("boundary_edge_count", 0) > 0:
+    if metadata.get("boundary_edge_count", 0) > 0 and boundary_policy == "strict":
         defects.add("hole")
     if metadata.get("flipped_normal_count", 0) > 0:
         defects.add("flipped_normals")
     if metadata.get("degenerate_face_count", 0) > 0:
         defects.add("degenerate_faces")
-    if metadata.get("uv_overlap_ratio", 0.0) >= uv_threshold or metadata.get("uv_overlap_triangle_count", 0) > 0:
+    if metadata.get("uv_overlap_ratio", 0.0) > uv_threshold or metadata.get("uv_overlap_triangle_count", 0) > 0:
         defects.add("uv_overlap")
 
     aspect_stats = metadata.get("triangle_aspect_stats", {})
     feature = float(aspect_stats.get("p95", 0.0) or 0.0)
     family = metadata.get("asset_family")
     threshold = (family_thresholds or {}).get(family, stretch_ratio)
-    if feature > 0 and feature >= threshold:
+    if feature > 0 and feature > threshold:
         defects.add("stretched_triangles")
 
     unknown = defects.difference(DEFECT_TYPES)
