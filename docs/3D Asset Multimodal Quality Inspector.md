@@ -56,7 +56,7 @@ Then open `http://127.0.0.1:7860` in a browser. The desktop shortcut created
 for this workspace starts the same service and opens the browser automatically.
 
 Required local components include Python dependencies from
-`requirements-demo.txt` and a working Blender executable. The Blender path
+`requirementsdemo.txt` and a working Blender executable. The Blender path
 and threshold JSON can be configured in the demo interface or runtime
 configuration.
 

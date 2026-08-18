@@ -52,10 +52,10 @@ python scripts/run_mock_baseline.py --manifest data/synthetic/manifest.jsonl --c
 python scripts/evaluate_predictions.py --gold data/synthetic/manifest.jsonl --pred results/mock_b0.jsonl --out results/mock_b0_metrics.json
 ```
 
-Launch the local quality-inspection demo after installing `requirements-demo.txt`:
+Launch the local quality-inspection demo after installing `requirementsdemo.txt`:
 
 ```powershell
-.venv\Scripts\python.exe -m pip install -r requirements-demo.txt
+.venv\Scripts\python.exe -m pip install -r requirementsdemo.txt
 .venv\Scripts\python.exe demo\app.py
 ```
 

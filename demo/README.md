@@ -9,7 +9,7 @@ pipeline. It uses real Blender renders and low-level geometry metadata from
 From the repository root:
 
 ```powershell
-.venv\Scripts\python.exe -m pip install -r requirements-demo.txt
+.venv\Scripts\python.exe -m pip install -r requirementsdemo.txt
 ```
 
 The rule-baseline mode does not load a VLM and is useful for checking the UI.

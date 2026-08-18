@@ -401,7 +401,7 @@ def _load_gradio():
     except ImportError as exc:
         raise SystemExit(
             "Missing Gradio. Install the demo dependencies with: "
-            ".venv\\Scripts\\python.exe -m pip install -r requirements-demo.txt"
+            ".venv\\Scripts\\python.exe -m pip install -r requirementsdemo.txt"
         ) from exc
     return gr
 
