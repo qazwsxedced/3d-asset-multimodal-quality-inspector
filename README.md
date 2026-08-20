@@ -60,14 +60,50 @@ Launch the local quality-inspection demo after installing `requirements-demo.txt
 ```
 
 The demo provides rule-baseline, Qwen2.5-VL diagnosis, and hybrid review
-modes over Blender-generated research assets and uploaded `.blend` fixtures. It displays multi-view/UV/normal
+modes over Blender-generated research assets and uploaded `.blend`/`.fbx`/`.obj` fixtures. It displays multi-view/UV/normal
 evidence and exports an HTML audit report. The rule checker remains the hard
 quality gate; the VLM supplies multimodal explanation and repair suggestions.
-It also accepts a local `.blend` file, runs Blender in background mode to
+It also accepts local `.blend`, `.fbx`, and `.obj` files, stages safe sidecars,
+runs Blender in background mode to
 produce runtime evidence, and sends the resulting asset through the same
 inspection flow.
 
 The demo acceptance paths are summarized in `reports/demo_validation.md`.
+
+The local demo writes self-contained HTML and JSON audit exports through
+`src/report_service.py`. Both formats preserve the canonical issue cards and
+include provenance from `src/provenance.py`: task ID, input hash, detector
+version, inspection mode/condition, detection time, and the hashes of the
+configured and effective threshold files.
+
+The typed result envelope is defined in `src/inspection_result.py`; score
+weights and defect penalties are externalized to
+`config/inspection_scoring.json`, with the effective score policy version and
+hash included in every score result. Cross-platform unit and regression
+contract checks are defined in `.github/workflows/ci.yml`.
+
+The demo is split into focused services: `demo/services/asset_service.py`
+handles staging, Blender preparation, and repair; `demo/services/rule_engine.py`
+handles deterministic evaluation; `demo/services/vlm_service.py` isolates VLM
+inference; and `demo/services/inspection_service.py` assembles the final
+result. New deterministic checks can be registered through
+`src/detector_registry.py` without adding another UI callback branch.
+Optional plug-ins placed as `detectors/*.py` may expose
+`register_detectors(registry)`; loading failures are reported as non-blocking
+plugin records instead of preventing the baseline page from starting.
+
+Blender workers keep import/configuration policy in
+`blender/asset_geometry.py` and `blender/inspection_config.py`, while
+`blender/issue_localization.py` records object names and capped face indices
+for issue-overlay and report localization.
+
+The web demo includes an object-level picker next to the normal Gradio 3D
+preview. Clicking a mesh, or an object button, selects the highest-priority
+matching issue card. Face-level evidence remains in the canonical locator JSON
+and Blender selection script; this is explicit because Gradio 5.50 does not
+expose its internal Babylon scene's face-picking event to Python. The picker
+has a safe fallback to the standard preview and object list when its optional
+Babylon CDN is unavailable.
 
 Run the external `.blend` validation path and compare the three inspection
 policies on the same inputs:
@@ -189,9 +225,10 @@ All paths are relative to the manifest directory. `metadata` is the structured i
 
 ```text
 blender/                 Blender data-generation scripts
+demo/services/           Upload, rule, VLM, and inspection services
 configs/                 B0–B4 and training hyperparameters
 scripts/                 Data, inference, evaluation, and error-analysis entry points
-src/                     Data protocol and experiment utilities
+src/                     Data protocol, result model, scoring, and detector registry
 data/                    Dataset manifests and local generated data
 results/                 Aggregate metrics and selected reports
 reports/                 Experiment plan and final results

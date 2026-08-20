@@ -1,0 +1,69 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "multi_part_fbx",
+      "passed": true,
+      "exit_code": 0,
+      "missing_keys": [],
+      "assertion_failures": [],
+      "log": "tests\\inspection_assets\\suite_report_provenance_round\\multi_part_fbx\\suite.log"
+    },
+    {
+      "name": "rigged_fbx",
+      "passed": true,
+      "exit_code": 0,
+      "missing_keys": [],
+      "assertion_failures": [],
+      "log": "tests\\inspection_assets\\suite_report_provenance_round\\rigged_fbx\\suite.log"
+    },
+    {
+      "name": "textured_fbx",
+      "passed": true,
+      "exit_code": 0,
+      "missing_keys": [],
+      "assertion_failures": [],
+      "log": "tests\\inspection_assets\\suite_report_provenance_round\\textured_fbx\\suite.log"
+    },
+    {
+      "name": "multi_material_obj",
+      "passed": true,
+      "exit_code": 0,
+      "missing_keys": [],
+      "assertion_failures": [],
+      "log": "tests\\inspection_assets\\suite_report_provenance_round\\multi_material_obj\\suite.log"
+    },
+    {
+      "name": "high_poly_obj",
+      "passed": true,
+      "exit_code": 0,
+      "missing_keys": [],
+      "assertion_failures": [],
+      "log": "tests\\inspection_assets\\suite_report_provenance_round\\high_poly_obj\\suite.log"
+    },
+    {
+      "name": "missing_texture_blend",
+      "passed": true,
+      "exit_code": 0,
+      "missing_keys": [],
+      "assertion_failures": [],
+      "log": "tests\\inspection_assets\\suite_report_provenance_round\\missing_texture_blend\\suite.log"
+    },
+    {
+      "name": "no_uv_obj",
+      "passed": true,
+      "exit_code": 0,
+      "missing_keys": [],
+      "assertion_failures": [],
+      "log": "tests\\inspection_assets\\suite_report_provenance_round\\no_uv_obj\\suite.log"
+    },
+    {
+      "name": "multi_lod_fbx",
+      "passed": true,
+      "exit_code": 0,
+      "missing_keys": [],
+      "assertion_failures": [],
+      "log": "tests\\inspection_assets\\suite_report_provenance_round\\multi_lod_fbx\\suite.log"
+    }
+  ]
+}

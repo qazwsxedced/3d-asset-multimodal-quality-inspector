@@ -31,6 +31,9 @@ wandb/
 *.whl
 *.log
 
+# Quarantined untrusted imports (e.g. suspicious generated FBX)
+.quarantine_*/
+
 # Generated inspection fixtures and Blender inspection outputs
 tests/inspection_assets/generated/
 tests/inspection_assets/inspection_results*/

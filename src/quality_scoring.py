@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
+from pathlib import Path
+
+from src.inspection_enums import CheckStatus, CoverageStatus
+from src.coverage_policy import has_material_statistics, has_runtime_statistics
 
 
 FACE_BUDGETS = {
@@ -59,6 +65,29 @@ PROFILE_COMPONENT_LABELS = {
     "animation": ("动画", "Animation"),
 }
 
+DEFAULT_SCORING_CONFIG = Path(__file__).resolve().parents[1] / "config" / "inspection_scoring.json"
+
+
+def load_scoring_config(path: Path = DEFAULT_SCORING_CONFIG) -> dict[str, Any]:
+    """Load score policy from JSON while retaining safe code defaults."""
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {
+            "config_version": "builtin-fallback",
+            "defect_penalties": dict(DEFECT_PENALTIES),
+            "profiles": {key: {"weights": dict(value)} for key, value in PROFILE_COMPONENT_WEIGHTS.items()},
+        }
+    if not isinstance(config, dict):
+        raise ValueError(f"Scoring config must be a JSON object: {path}")
+    return config
+
+
+def scoring_config_hash(config: dict[str, Any]) -> str:
+    """Hash the effective score policy for reproducible reports."""
+    payload = json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
 
 def compute_health_score(
     metadata: dict[str, Any],
@@ -69,8 +98,12 @@ def compute_health_score(
     soft_model_used: bool = False,
     configured_face_budget: int | None = None,
     asset_profile: str | None = None,
+    scoring_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Score observable quality signals; do not imply subjective visual quality."""
+    policy = scoring_config or load_scoring_config()
+    configured_penalties = policy.get("defect_penalties", {}) or {}
+    effective_defect_penalties = {**DEFECT_PENALTIES, **{str(key): int(value) for key, value in configured_penalties.items()}}
     textured = int(metadata.get("texture_image_count", 0) or 0) > 0
     rigged = bool(metadata.get("source_has_armature") or metadata.get("source_has_animation"))
     realtime_target = target_face_budget != "Auto" or bool(metadata.get("source_lod_count"))
@@ -104,7 +137,7 @@ def compute_health_score(
     penalties: list[dict[str, Any]] = []
 
     for defect in defects:
-        penalty = DEFECT_PENALTIES.get(defect, 0)
+        penalty = effective_defect_penalties.get(defect, 0)
         if penalty:
             penalties.append({"code": defect, "penalty": penalty, "reason": "detected blocking geometry/UV defect"})
 
@@ -176,17 +209,17 @@ def compute_health_score(
     }
 
     hard_checks = [
-        {"name": "topology_and_watertightness", "status": "fail" if any(item in defects for item in ("hole", "non_manifold", "degenerate_faces")) else "pass", "evidence": {key: metadata.get(key, 0) for key in ("boundary_edge_count", "non_manifold_edge_count", "degenerate_face_count", "loose_vertex_count")}},
-        {"name": "face_budget", "status": "fail" if budget_overrun else "pass" if budget else "not_configured", "target": budget_label, "face_count": face_count, "overrun_ratio": budget_overrun},
-        {"name": "normals", "status": "fail" if "flipped_normals" in defects else "pass", "flipped_normal_count": metadata.get("flipped_normal_count", 0)},
-        {"name": "uv_and_texture", "status": "fail" if "uv_overlap" in defects or metadata.get("missing_texture_count", 0) else "pass", "evidence": {key: metadata.get(key, 0) for key in ("uv_overlap_ratio", "uv_overlap_triangle_count", "missing_texture_count")}},
-        {"name": "pbr_material_wiring", "status": "fail" if metadata.get("pbr_channel_issue_count", 0) else "pass", "issue_count": metadata.get("pbr_channel_issue_count", 0), "material_count": metadata.get("material_count", 0)},
+        {"name": "topology_and_watertightness", "status": CheckStatus.FAILED.value if any(item in defects for item in ("hole", "non_manifold", "degenerate_faces")) else CheckStatus.PASSED.value, "evidence": {key: metadata.get(key, 0) for key in ("boundary_edge_count", "non_manifold_edge_count", "degenerate_face_count", "loose_vertex_count")}},
+        {"name": "face_budget", "status": CheckStatus.FAILED.value if budget_overrun else CheckStatus.PASSED.value if budget else CheckStatus.NOT_CHECKED.value, "target": budget_label, "face_count": face_count, "overrun_ratio": budget_overrun},
+        {"name": "normals", "status": CheckStatus.FAILED.value if "flipped_normals" in defects else CheckStatus.PASSED.value, "flipped_normal_count": metadata.get("flipped_normal_count", 0)},
+        {"name": "uv_and_texture", "status": CheckStatus.FAILED.value if "uv_overlap" in defects or metadata.get("missing_texture_count", 0) else CheckStatus.PASSED.value, "evidence": {key: metadata.get(key, 0) for key in ("uv_overlap_ratio", "uv_overlap_triangle_count", "missing_texture_count")}},
+        {"name": "pbr_material_wiring", "status": CheckStatus.FAILED.value if metadata.get("pbr_channel_issue_count", 0) else CheckStatus.PASSED.value, "issue_count": metadata.get("pbr_channel_issue_count", 0), "material_count": metadata.get("material_count", 0)},
         {"name": "runtime_readiness", "status": metadata.get("loading_risk", "not_available"), "estimated_draw_calls": metadata.get("estimated_draw_calls", 0), "estimated_load_time_seconds": metadata.get("estimated_load_time_seconds", 0)},
     ]
     if rigged:
         hard_checks.append({
             "name": "skinning_weights",
-            "status": "fail" if metadata.get("unbound_vertex_count", 0) or metadata.get("weight_sum_error_count", 0) else "pass",
+            "status": CheckStatus.FAILED.value if metadata.get("unbound_vertex_count", 0) or metadata.get("weight_sum_error_count", 0) else CheckStatus.PASSED.value,
             "unbound_vertex_ratio": metadata.get("unbound_vertex_ratio", 0),
             "weight_sum_error_ratio": metadata.get("weight_sum_error_ratio", 0),
         })
@@ -268,17 +301,17 @@ def compute_health_score(
     component_penalties.setdefault("animation", [])
     uv_available = int(metadata.get("uv_layer_count", metadata.get("source_uv_layer_count", 0)) or 0) > 0 and metadata.get("uv_status", "present") != "not_present"
     uv_sampled = bool(metadata.get("uv_analysis_sampled") or metadata.get("uv_overlap_analysis_sampled"))
-    material_stats_available = "material_count" in metadata or "texture_image_count" in metadata or "pbr_channel_issue_count" in metadata
-    runtime_stats_available = "loading_risk" in metadata
+    material_stats_available = has_material_statistics(metadata)
+    runtime_stats_available = has_runtime_statistics(metadata)
     geometry_stats_available = bool(metadata.get("vertex_count") and metadata.get("face_count"))
     deformation_sampled = bool(metadata.get("deformation_self_intersection_sample_count", 0))
     component_status = {
-        "geometry_and_defects": "checked" if geometry_stats_available else "not_checked",
-        "uv": "sampled" if uv_sampled else "checked" if uv_available else "not_checked" if metadata.get("texture_image_count", 0) else "not_applicable",
-        "materials": "checked" if material_stats_available else "not_checked",
-        "runtime": "checked" if runtime_stats_available else "not_checked",
-        "skinning": "checked" if rigged else "not_applicable",
-        "animation": "sampled" if deformation_sampled else "not_checked" if rigged else "not_applicable",
+        "geometry_and_defects": CoverageStatus.CHECKED.value if geometry_stats_available else CoverageStatus.NOT_CHECKED.value,
+        "uv": CoverageStatus.SAMPLED.value if uv_sampled else CoverageStatus.CHECKED.value if uv_available else CoverageStatus.NOT_CHECKED.value if metadata.get("texture_image_count", 0) else CoverageStatus.NOT_APPLICABLE.value,
+        "materials": CoverageStatus.CHECKED.value if material_stats_available else CoverageStatus.NOT_CHECKED.value,
+        "runtime": CoverageStatus.CHECKED.value if runtime_stats_available else CoverageStatus.NOT_CHECKED.value,
+        "skinning": CoverageStatus.CHECKED.value if rigged else CoverageStatus.NOT_APPLICABLE.value,
+        "animation": CoverageStatus.SAMPLED.value if deformation_sampled else CoverageStatus.NOT_CHECKED.value if rigged else CoverageStatus.NOT_APPLICABLE.value,
     }
     component_coverage = {
         "geometry_and_defects": 1.0 if geometry_stats_available else 0.0,
@@ -292,7 +325,11 @@ def compute_health_score(
         # animation timeline, so they must lower confidence by design.
         "animation": 0.5 if deformation_sampled else 0.5 if rigged and metadata.get("animation_playability") not in {None, "not_available"} else 0.0,
     }
-    raw_profile_weights = PROFILE_COMPONENT_WEIGHTS[profile]
+    configured_profile = (policy.get("profiles", {}) or {}).get(profile, {}) or {}
+    raw_profile_weights = {
+        **PROFILE_COMPONENT_WEIGHTS[profile],
+        **{str(key): float(value) for key, value in (configured_profile.get("weights", {}) or {}).items()},
+    }
     excluded_components = []
     applicable_profile_weights = {}
     for key, weight in raw_profile_weights.items():
@@ -356,6 +393,8 @@ def compute_health_score(
         "profile_fit_next_focus": profile_next_focus,
         "profile_fit_explanation": profile_explanation,
         "profile_fit_is_policy_weighted": True,
+        "score_config_version": str(policy.get("config_version", "unknown")),
+        "score_config_hash": scoring_config_hash(policy),
         "total_penalty": total_penalty,
         "penalties": penalties,
         "hard_checks": hard_checks,

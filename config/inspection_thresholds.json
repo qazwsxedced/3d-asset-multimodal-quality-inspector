@@ -15,6 +15,7 @@
   "max_material_slots_per_object": 8,
   "max_diagnostic_triangles": 50000,
   "max_component_gap_pairs": 200000,
+  "max_upload_size_bytes": 2147483648,
   "job_timeout_seconds": 600,
   "preview_views": 4,
   "preview_resolution": 192

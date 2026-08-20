@@ -9,9 +9,12 @@
     {"path": "rigged_mesh_count", "op": "gte", "value": 1, "label": "skinned mesh detected"},
     {"path": "deformation_self_intersection_check", "op": "eq", "value": "passed_sampled_no_non_adjacent_overlap", "label": "sampled deformation probe completes"}
   ]},
-  {"name": "textured_fbx", "format": "fbx", "expected": ["material_count", "texture_image_count", "pbr_material_reports"], "assertions": [
+  {"name": "textured_fbx", "format": "fbx", "expected": ["material_count", "texture_image_count", "pbr_material_reports", "pbr_unresolved_chain_count"], "assertions": [
     {"path": "texture_image_count", "op": "gte", "value": 1, "label": "texture image detected"},
-    {"path": "pbr_material_reports.0.material_mode", "op": "eq", "value": "textured", "label": "material classified as textured"}
+    {"path": "pbr_material_reports.0.material_mode", "op": "eq", "value": "textured", "label": "material classified as textured"},
+    {"path": "pbr_material_reports.0.image_nodes.0.role_hints", "op": "contains", "value": "Base Color", "label": "texture role hint identifies base color"},
+    {"path": "pbr_material_reports.0.channels.Base Color.source_node_path.0.type", "op": "eq", "value": "TEX_IMAGE", "label": "channel keeps source node path"},
+    {"path": "pbr_unresolved_chain_count", "op": "eq", "value": 0, "label": "textured fixture has no unresolved PBR chain"}
   ]},
   {"name": "multi_material_obj", "format": "obj", "expected": ["material_count", "material_slot_count"], "assertions": [
     {"path": "material_count", "op": "gte", "value": 2, "label": "multiple materials detected"},
