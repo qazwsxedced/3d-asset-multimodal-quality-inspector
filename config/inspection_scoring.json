@@ -1,0 +1,63 @@
+{
+  "config_version": "1.0",
+  "defect_penalties": {
+    "non_manifold": 22,
+    "hole": 20,
+    "degenerate_faces": 15,
+    "uv_overlap": 12,
+    "flipped_normals": 10,
+    "stretched_triangles": 8
+  },
+  "profiles": {
+    "static_geometry": {
+      "weights": {
+        "geometry_and_defects": 0.6,
+        "uv": 0.075,
+        "materials": 0.075,
+        "runtime": 0.25
+      }
+    },
+    "realtime_or_xr": {
+      "weights": {
+        "geometry_and_defects": 0.3,
+        "uv": 0.125,
+        "materials": 0.125,
+        "runtime": 0.45
+      }
+    },
+    "visual_display": {
+      "weights": {
+        "geometry_and_defects": 0.25,
+        "uv": 0.25,
+        "materials": 0.3,
+        "runtime": 0.2
+      }
+    },
+    "3d_printing": {
+      "weights": {
+        "geometry_and_defects": 0.75,
+        "uv": 0.025,
+        "materials": 0.025,
+        "runtime": 0.2
+      }
+    },
+    "character_or_animated": {
+      "weights": {
+        "geometry_and_defects": 0.15,
+        "uv": 0.075,
+        "materials": 0.075,
+        "runtime": 0.1,
+        "skinning": 0.3,
+        "animation": 0.3
+      }
+    },
+    "textured_asset": {
+      "weights": {
+        "geometry_and_defects": 0.25,
+        "uv": 0.25,
+        "materials": 0.25,
+        "runtime": 0.25
+      }
+    }
+  }
+}

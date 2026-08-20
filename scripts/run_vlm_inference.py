@@ -27,22 +27,47 @@ def parse_json_object(text: str) -> dict:
         return {"_raw": text}
 
 
+def resolve_device(torch) -> str:
+    """Choose the best available device without assuming CUDA is installed."""
+    if torch.cuda.is_available():
+        return "cuda"
+    mps = getattr(getattr(torch.backends, "mps", None), "is_available", lambda: False)
+    if mps():
+        return "mps"
+    return "cpu"
+
+
 def load_stack(model_id: str, adapter: Path | None, min_pixels: int, max_pixels: int, load_in_4bit: bool, offload_dir: Path):
     try:
         import torch
-        from transformers import AutoProcessor, BitsAndBytesConfig, Qwen2_5_VLForConditionalGeneration
+        from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
     except ImportError as exc:
         raise SystemExit("Missing torch/transformers. Run scripts/install_gpu.ps1 first.") from exc
-    offload_dir.mkdir(parents=True, exist_ok=True)
-    model_kwargs = {"torch_dtype": "auto", "device_map": "auto", "offload_folder": str(offload_dir), "offload_buffers": True}
-    if load_in_4bit:
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=True)
+    device = resolve_device(torch)
+    use_4bit = bool(load_in_4bit and device == "cuda")
+    if load_in_4bit and not use_4bit:
+        print(f"4-bit CUDA quantization is unavailable on {device}; loading without bitsandbytes quantization.", file=sys.stderr)
+    model_kwargs = {"torch_dtype": torch.float16 if device in {"cuda", "mps"} else torch.float32}
+    if device == "cuda":
+        offload_dir.mkdir(parents=True, exist_ok=True)
+        model_kwargs.update({"device_map": "auto", "offload_folder": str(offload_dir), "offload_buffers": True})
+    if use_4bit:
+        from transformers import BitsAndBytesConfig
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **model_kwargs)
+    if device != "cuda":
+        model.to(device)
     processor = AutoProcessor.from_pretrained(model_id, min_pixels=min_pixels, max_pixels=max_pixels)
     if adapter:
         try:
             from peft import PeftModel
-            model = PeftModel.from_pretrained(model, str(adapter), offload_folder=str(offload_dir), offload_buffers=True)
+            adapter_kwargs = {"offload_folder": str(offload_dir), "offload_buffers": True} if device == "cuda" else {}
+            model = PeftModel.from_pretrained(model, str(adapter), **adapter_kwargs)
         except ImportError as exc:
             raise SystemExit("Loading --adapter requires peft.") from exc
     return model, processor

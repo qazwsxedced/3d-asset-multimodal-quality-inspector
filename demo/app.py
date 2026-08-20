@@ -14,28 +14,49 @@ Run from the repository root:
 
 from __future__ import annotations
 
-import base64
 import html
 import json
-import mimetypes
 import os
 import shutil
-import subprocess
 import sys
-import threading
-import time
 import uuid
-from queue import Empty, Queue
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.data_protocol import build_condition, compact_metadata, read_jsonl
+from src.data_protocol import compact_metadata, read_jsonl
+from src.blender_runner import BlenderJobRunner
+from src.inspection_schema import normalize_issue_list
+from src.detector_registry import DEFAULT_DETECTOR_REGISTRY, DetectorContext
+from src.error_reporting import format_failure_message, write_failure_log
+from src.provenance import build_provenance
 from src.quality_scoring import compute_health_score
+from src.threshold_config import (
+    load_thresholds as load_validated_thresholds,
+    validate_threshold_file,
+)
+from src.coverage_policy import (
+    animation_coverage_status,
+    animation_is_present,
+    has_material_statistics,
+    has_runtime_statistics,
+)
+from src.report_service import write_html_report, write_json_audit
+from src.task_store import TaskStore
+from src.task_queue import TaskQueue
+from src.interactive_locator import (
+    INTERACTIVE_LOCATOR_CSS,
+    INTERACTIVE_LOCATOR_JS,
+    render_interactive_locator_html,
+    resolve_object_pick,
+)
+from demo.services.asset_service import AssetDependencies, AssetService
+from demo.services.inspection_service import InspectionDependencies, InspectionService
+from demo.services.rule_engine import RuleEngine, RuleEngineDependencies
+from demo.services.vlm_service import VLMService
 from scripts.run_rule_baseline import infer_defects, infer_severity
-from scripts.run_vlm_inference import load_stack, parse_json_object
 
 
 DEFAULT_MANIFEST = ROOT / "data" / "blender_research_v5_multiasset" / "manifest.jsonl"
@@ -44,10 +65,12 @@ DEFAULT_MODEL = "Qwen/Qwen2.5-VL-3B-Instruct"
 DEFAULT_THRESHOLDS = ROOT / "config" / "inspection_thresholds.json"
 REPORT_DIR = ROOT / "demo_reports"
 RUNTIME_DIR = ROOT / "runtime_uploads"
-BLENDER_CANDIDATES = [
-    Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) / "Blender Foundation" / "Blender 5.2" / "blender.exe",
-    Path("C:/Program Files/Blender Foundation/Blender 5.2/blender.exe"),
-]
+DETECTOR_PLUGIN_DIR = ROOT / "detectors"
+BLENDER_ENV_VARS = ("BLENDER_EXECUTABLE", "BLENDER_PATH")
+
+DETECTOR_PLUGIN_STATUS = DEFAULT_DETECTOR_REGISTRY.load_plugins(
+    sorted(DETECTOR_PLUGIN_DIR.glob("*.py")) if DETECTOR_PLUGIN_DIR.exists() else []
+)
 
 ASSET_PROFILE_CHOICES = [
     "Auto",
@@ -182,8 +205,10 @@ def _profile_risk_text(health: dict[str, Any], language: str) -> str:
             parts.append(f"{label} (priority {priority}, {reason}, {status})")
     return "、".join(parts) if parts else ("暂无突出风险" if language == "中文" else "No prominent profile risk")
 
-_MODEL_CACHE: dict[str, Any] = {}
-_ACTIVE_PROCESSES: dict[str, subprocess.Popen] = {}
+_VLM_SERVICE = VLMService()
+_BLENDER_RUNNER = BlenderJobRunner(ROOT)
+_TASK_STORE = TaskStore(RUNTIME_DIR)
+_TASK_QUEUE = TaskQueue(RUNTIME_DIR, max_workers=1)
 try:
     from gradio import Progress as _GradioProgress
     _DEFAULT_PROGRESS = _GradioProgress()
@@ -192,146 +217,134 @@ except ImportError:
 
 
 def _progress_update(progress: Any, value: float, description: str) -> None:
+    """Update a Gradio callback progress object when one is available."""
     if callable(progress):
         progress(value, desc=description)
 
 
 def cancel_running_jobs() -> str:
     """Terminate active Blender subprocesses started by this demo."""
-    cancelled = 0
-    for process in list(_ACTIVE_PROCESSES.values()):
-        if process.poll() is None:
-            process.terminate()
-            cancelled += 1
-    return f"Cancellation requested for {cancelled} active job(s)."
+    return _BLENDER_RUNNER.cancel()
 
 
 def run_blender_job(command: list[str], job_dir: Path, progress: Any = None, timeout: int = 240) -> Path:
-    """Run Blender with persistent logs, stage tracking, and actionable failures."""
-    log_path = job_dir / "blender.log"
-    output_queue: Queue[str | None] = Queue()
-    process = subprocess.Popen(command, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                               text=True, bufsize=1)
-    _ACTIVE_PROCESSES[str(job_dir)] = process
-    started = time.monotonic()
+    """Run Blender through the shared cross-platform job service."""
+    return _BLENDER_RUNNER.run(command, job_dir, progress, timeout)
 
-    def read_output() -> None:
-        assert process.stdout is not None
-        for line in process.stdout:
-            output_queue.put(line)
-        output_queue.put(None)
 
-    reader = threading.Thread(target=read_output, daemon=True)
-    reader.start()
-    lines: list[str] = []
-    last_line = ""
-    timed_out = False
-    stage = 0.16
-    descriptions = [
-        ("OBJ/FBX/Blend 导入阶段", 0.22),
-        ("几何、材质和动画统计阶段", 0.52),
-        ("多视图和诊断图渲染阶段", 0.78),
-        ("运行时报告整理阶段", 0.92),
+def query_task_status(task_id: str | None) -> dict[str, Any]:
+    """Return one persisted task plus an explicit retry decision."""
+    record = _TASK_STORE.get(task_id)
+    record["retry_decision"] = _TASK_STORE.retry_decision(record)
+    return record
+
+
+def list_task_history() -> list[dict[str, Any]]:
+    """Return recent task records for the task-control panel."""
+    return [
+        {**record, "retry_decision": _TASK_STORE.retry_decision(record)}
+        for record in _TASK_STORE.list(limit=50)
     ]
-    current_stage = descriptions[0][0]
-    _progress_update(progress, stage, descriptions[0][0])
-    finished = False
-    while not finished:
-        try:
-            line = output_queue.get(timeout=0.2)
-            if line is None:
-                finished = True
-                continue
-            lines.append(line)
-            last_line = line.strip()
-            lowered = line.lower()
-            if "obj import" in lowered or "fbx" in lowered or "read blend" in lowered:
-                current_stage = descriptions[0][0]
-                _progress_update(progress, descriptions[0][1], descriptions[0][0])
-            elif "inspect_asset.py" in lowered or "statistics" in lowered or "stats" in lowered or "analy" in lowered:
-                current_stage = descriptions[1][0]
-                _progress_update(progress, descriptions[1][1], descriptions[1][0])
-            elif "starting gltf" in lowered or "render" in lowered or "saved:" in lowered:
-                current_stage = descriptions[2][0]
-                _progress_update(progress, descriptions[2][1], descriptions[2][0])
-            elif "manifest" in lowered or "report" in lowered:
-                current_stage = descriptions[3][0]
-                _progress_update(progress, descriptions[3][1], descriptions[3][0])
-        except Empty:
-            if process.poll() is not None and not reader.is_alive():
-                finished = True
-        if time.monotonic() - started > timeout:
-            timed_out = True
-            process.kill()
-            lines.append(f"Timed out after {timeout}s during {current_stage}\n")
-            break
-    reader.join(timeout=2)
-    return_code = process.wait(timeout=10)
-    _ACTIVE_PROCESSES.pop(str(job_dir), None)
-    elapsed = round(time.monotonic() - started, 1)
-    log_text = "".join(lines)
-    log_path.write_text(log_text, encoding="utf-8", errors="replace")
-    status_path = job_dir / "job_status.json"
-    status = {
-        "command": command,
-        "return_code": return_code,
-        "timed_out": timed_out,
-        "timeout_seconds": timeout,
-        "elapsed_seconds": elapsed,
-        "last_stage": current_stage,
-        "last_output": last_line,
-        "log_file": str(log_path),
+
+
+def _json_safe(value: Any) -> Any:
+    """Convert a callback payload into data that survives a process restart."""
+    return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+
+
+def _asset_result_payload(
+    manifest: str,
+    asset_info: dict[str, Any],
+    views: Any,
+    uv: Any,
+    uv_heatmap: Any,
+    normal: Any,
+    model_preview: Any,
+    issue_overlay: Any,
+    upload_status: str,
+    interactive_html: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "manifest": str(manifest),
+        "asset_info": _json_safe(asset_info),
+        "views": _json_safe(views),
+        "uv": _json_safe(uv),
+        "uv_heatmap": _json_safe(uv_heatmap),
+        "normal": _json_safe(normal),
+        "model_preview": _json_safe(model_preview),
+        "issue_overlay": _json_safe(issue_overlay),
+        "interactive_html": interactive_html,
+        "upload_status": str(upload_status),
+        "inspection_task_id": str(asset_info.get("task_id", "")),
     }
-    status_path.write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
-    if timed_out:
-        stage_suggestions = {
-            descriptions[0][0]: "检查文件是否过大、是否包含复杂外部链接或损坏的 FBX/Blend 数据；必要时先用轻量导出验证。",
-            descriptions[1][0]: "降低诊断三角形上限、暂时关闭复杂动画/组件分析，或延长 job_timeout_seconds。",
-            descriptions[2][0]: "减少 preview_views 和 preview_resolution，先完成规则统计，再单独生成高分辨率预览。",
-            descriptions[3][0]: "检查磁盘空间、runtime_uploads 目录权限和 Blender 日志中的报告写入错误。",
-        }
-        suggestion = stage_suggestions.get(current_stage, "查看 Blender 日志尾部，并根据当前阶段调整检测配置。")
-        tail = log_text[-5000:]
-        raise RuntimeError(
-            f"Blender job timed out after {elapsed}s during {current_stage}. "
-            f"Log: {log_path}\nStatus: {status_path}\n"
-            f"建议 / Suggested action: {suggestion}\n{tail}"
-        )
-    if return_code != 0:
-        tail = log_text[-5000:]
-        raise RuntimeError(f"Blender job failed (exit={return_code}) during {current_stage}. Log: {log_path}\nStatus: {status_path}\n{tail}")
-    _progress_update(progress, 1.0, "检测任务完成")
-    return log_path
+
+
+def _queue_progress(update: Any):
+    """Adapt the runner's Gradio-style progress callback to TaskQueue."""
+    def callback(value: float, desc: str = "") -> None:
+        update(value, desc)
+    return callback
+
+
+def _submit_background_task(kind: str, payload: dict[str, Any], worker: Any) -> tuple[dict[str, Any], str, str, list[dict[str, Any]]]:
+    record = _TASK_QUEUE.submit(kind, payload, worker)
+    message = f"后台任务已提交 / Background task queued: {record['task_id']}。点击 Load task result / 加载任务结果轮询。"
+    return record, message, record["task_id"], list_task_history()
+
+
+def submit_background_upload(file_path: str | None, blender_text: str, threshold_text: str):
+    def worker(_task_dir: Path, update: Any) -> dict[str, Any]:
+        prepared = _asset_service().prepare_uploaded_asset(file_path, blender_text, threshold_text, _queue_progress(update))
+        return _asset_result_payload(prepared[0], prepared[2], prepared[3], prepared[4], prepared[5], prepared[6], prepared[7], prepared[8], prepared[9], render_interactive_locator_html(prepared[7], issue_overlay_path=prepared[8]))
+    return _submit_background_task("upload", {"source_file": str(file_path or ""), "threshold_config": threshold_text}, worker)
+
+
+def submit_background_repair(manifest_text: str, blender_text: str, threshold_text: str):
+    def worker(_task_dir: Path, update: Any) -> dict[str, Any]:
+        prepared = _asset_service().repair_and_reinspect(manifest_text, blender_text, threshold_text, _queue_progress(update))
+        return _asset_result_payload(prepared[0], prepared[2], prepared[3], prepared[4], prepared[5], prepared[6], prepared[7], prepared[8], prepared[9], render_interactive_locator_html(prepared[7], issue_overlay_path=prepared[8]))
+    return _submit_background_task("repair", {"manifest": manifest_text, "threshold_config": threshold_text}, worker)
+
+
+def submit_background_generation(blender_text: str, threshold_text: str, asset_family: str, defect: str):
+    def worker(_task_dir: Path, update: Any) -> dict[str, Any]:
+        output = generate_demo_asset(blender_text, threshold_text, asset_family, defect, _queue_progress(update))
+        return _asset_result_payload(output[0], output[2], output[3], output[4], output[5], output[6], output[7], output[8], output[10], output[9])
+    return _submit_background_task("generation", {"asset_family": asset_family, "defect": defect, "threshold_config": threshold_text}, worker)
+
+
+def load_background_task_result(task_id: str | None):
+    """Load completed queue output into the same preview components as sync upload."""
+    gr = _load_gradio()
+    record = _TASK_QUEUE.get(task_id)
+    history = list_task_history()
+    if record.get("status") != "completed":
+        message = f"后台任务状态 / Background task status: {record.get('status', 'not_found')} — {record.get('stage', record.get('error', ''))}"
+        skipped = [gr.skip()] * 10
+        return (*skipped, message, record, history, str(task_id or ""))
+    result = _TASK_QUEUE.read_result(task_id)
+    if not result or not result.get("manifest"):
+        message = "任务已完成，但结果文件不可用，请查看任务状态和日志。"
+        skipped = [gr.skip()] * 10
+        return (*skipped, message, record, history, str(task_id or ""))
+    manifest = Path(str(result["manifest"]))
+    rows, _ = load_rows(manifest)
+    row = rows[0]
+    sample_update = gr.Dropdown(choices=[row["id"]], value=row["id"], label="Test asset")
+    model_preview = result.get("model_preview")
+    interactive_html = result.get("interactive_html") or render_interactive_locator_html(model_preview, issue_overlay_path=result.get("issue_overlay"))
+    return (
+        str(manifest), sample_update, result.get("asset_info", {}), result.get("views", []),
+        result.get("uv"), result.get("uv_heatmap"), result.get("normal"), model_preview,
+        result.get("issue_overlay"), interactive_html, result.get("upload_status", ""),
+        record, history, str(task_id or ""),
+    )
 
 
 def load_thresholds(path: Path = DEFAULT_THRESHOLDS) -> dict[str, Any]:
     """Load project-specific inspection thresholds with safe defaults."""
-    defaults = {
-        "max_faces": 50_000,
-        "max_uv_overlap_ratio": 0.001,
-        "max_triangle_aspect_p95": 8.0,
-        "max_texture_size": 4096,
-        "min_texture_size": 512,
-        "max_material_slots": 8,
-        "max_draw_calls": 100,
-        "max_texture_memory_bytes": 1_073_741_824,
-        "max_estimated_load_time_seconds": 8.0,
-        "max_influences_per_vertex": 4,
-        "weight_sum_tolerance": 0.05,
-        "max_diagnostic_triangles": 50_000,
-        "max_component_gap_pairs": 200_000,
-        "job_timeout_seconds": 600,
-        "preview_views": 4,
-        "preview_resolution": 192,
-    }
-    if not path.exists():
-        return defaults
-    try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
-        defaults.update({key: value for key, value in loaded.items() if key in defaults})
-    except (OSError, json.JSONDecodeError, AttributeError):
-        pass
-    return defaults
+    return load_validated_thresholds(path)
 
 
 def resolve_threshold_path(text: str | None) -> Path:
@@ -340,6 +353,9 @@ def resolve_threshold_path(text: str | None) -> Path:
         path = (ROOT / path).resolve()
     if not path.exists():
         raise ValueError(f"Threshold config not found: {path}")
+    errors = validate_threshold_file(path)
+    if errors:
+        raise ValueError("Invalid threshold config:\n- " + "\n- ".join(errors))
     return path
 
 DEFECT_LABELS_ZH = {
@@ -413,10 +429,27 @@ def load_rows(manifest: Path) -> tuple[list[dict[str, Any]], dict[str, dict[str,
 
 
 def find_blender() -> str:
-    for candidate in BLENDER_CANDIDATES:
+    candidates: list[Path] = []
+    for variable in BLENDER_ENV_VARS:
+        configured = os.environ.get(variable, "").strip()
+        if configured:
+            candidates.append(Path(configured).expanduser())
+    if sys.platform == "win32":
+        candidates.extend([
+            Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) / "Blender Foundation" / "Blender 5.2" / "blender.exe",
+            Path("C:/Program Files/Blender Foundation/Blender 5.2/blender.exe"),
+        ])
+    elif sys.platform == "darwin":
+        candidates.extend([
+            Path("/Applications/Blender.app/Contents/MacOS/Blender"),
+            Path.home() / "Applications/Blender.app/Contents/MacOS/Blender",
+        ])
+    else:
+        candidates.extend([Path("/usr/bin/blender"), Path("/usr/local/bin/blender")])
+    for candidate in candidates:
         if candidate.exists():
             return str(candidate)
-    return "blender"
+    return shutil.which("blender") or "blender"
 
 
 def choose_adaptive_inspection_settings(source: Path, thresholds: dict[str, Any]) -> dict[str, Any]:
@@ -457,7 +490,7 @@ def choose_adaptive_inspection_settings(source: Path, thresholds: dict[str, Any]
     }
 
 
-def write_runtime_inspection_metadata(manifest: Path, settings: dict[str, Any]) -> None:
+def write_runtime_inspection_metadata(manifest: Path, settings: dict[str, Any], staging: dict[str, Any] | None = None) -> None:
     """Persist the effective adaptive policy next to the generated manifest."""
     if not manifest.exists():
         return
@@ -468,103 +501,58 @@ def write_runtime_inspection_metadata(manifest: Path, settings: dict[str, Any]) 
         if metadata.get("runtime_geometry_adaptive"):
             strategy_record["geometry_adaptive"] = metadata["runtime_geometry_adaptive"]
         metadata["runtime_inspection_strategy"] = strategy_record
+        if staging:
+            metadata["asset_staging"] = staging
     manifest.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n", encoding="utf-8")
 
 
-def prepare_uploaded_asset(file_path: str | None, blender_text: str, threshold_text: str = str(DEFAULT_THRESHOLDS), progress: Any = _DEFAULT_PROGRESS) -> tuple[str, str, dict[str, Any], str, str, str, str, str, str, str]:
-    """Convert an uploaded 3D asset into the same runtime manifest used by samples."""
-    if not file_path:
-        raise ValueError("Please choose a .blend, .fbx, or .obj file first.")
-    source = Path(file_path)
-    if source.suffix.lower() not in {".blend", ".fbx", ".obj"}:
-        raise ValueError("Supported formats are .blend, .fbx, and .obj.")
-    blender = blender_text.strip() or find_blender()
-    if blender != "blender" and not Path(blender).exists():
-        raise ValueError(f"Blender executable not found: {blender}")
-    threshold_path = resolve_threshold_path(threshold_text)
-    job_dir = RUNTIME_DIR / f"job_{uuid.uuid4().hex[:10]}"
-    job_dir.mkdir(parents=True, exist_ok=True)
-    copied = job_dir / source.name
-    _progress_update(progress, 0.05, "上传阶段")
-    shutil.copy2(source, copied)
-    thresholds = load_thresholds(threshold_path)
-    adaptive = choose_adaptive_inspection_settings(copied, thresholds)
-    runtime_threshold_path = job_dir / "inspection_thresholds.runtime.json"
-    runtime_thresholds = dict(thresholds)
-    runtime_thresholds.update({key: adaptive[key] for key in ("preview_views", "preview_resolution", "max_diagnostic_triangles")})
-    runtime_thresholds["runtime_inspection_strategy"] = adaptive["strategy"]
-    runtime_threshold_path.write_text(json.dumps(runtime_thresholds, ensure_ascii=False, indent=2), encoding="utf-8")
-    command = [blender, "-b", "-P", str(ROOT / "blender" / "inspect_asset.py"), "--", "--input", str(copied), "--out", str(job_dir), "--views", str(adaptive["preview_views"]), "--resolution", str(adaptive["preview_resolution"]), "--config", str(runtime_threshold_path)]
-    log_path = run_blender_job(command, job_dir, progress, timeout=int(thresholds["job_timeout_seconds"]))
-    manifest = job_dir / "manifest.jsonl"
-    if not manifest.exists():
-        raise RuntimeError("Blender finished without producing a runtime manifest.")
-    write_runtime_inspection_metadata(manifest, adaptive)
-    rows, indexed = load_rows(manifest)
-    row = rows[0]
-    paths = resolve_image_paths(row, manifest)
-    info = {"source_file": source.name, "runtime_job": str(job_dir), "log_file": str(log_path), "adaptive_inspection": adaptive, "metadata": compact_metadata(row["metadata"])}
-    gr = _load_gradio()
-    sample_update = gr.Dropdown(choices=[row["id"]], value=row["id"], label="Test asset")
-    return str(manifest), sample_update, info, paths["views"], paths["uv"] or None, paths["uv_heatmap"] or None, paths["normal"] or None, paths["model"] or None, paths["model_overlay"] or None, f"Prepared successfully: {source.name} | strategy: {adaptive['strategy']} ({adaptive['preview_views']} views / {adaptive['preview_resolution']}px) | log: {log_path}"
-
-
-def repair_and_reinspect(manifest_text: str, blender_text: str, threshold_text: str = str(DEFAULT_THRESHOLDS), progress: Any = _DEFAULT_PROGRESS) -> tuple[str, str, dict[str, Any], str, str, str, str, str, str, str]:
-    """Safely repair a runtime copy, then run the full inspection pipeline again."""
-    if not manifest_text:
-        raise ValueError("Prepare or upload an asset before requesting repair.")
-    manifest = Path(manifest_text).expanduser().resolve()
-    if not manifest.exists():
-        raise ValueError(f"Runtime manifest not found: {manifest}")
-    source_candidates = sorted(
-        (path for path in manifest.parent.iterdir() if path.suffix.lower() in {".blend", ".fbx", ".obj"}),
-        key=lambda path: path.name.lower(),
+def _asset_service() -> AssetService:
+    return AssetService(
+        ROOT,
+        RUNTIME_DIR,
+        AssetDependencies(
+            run_blender_job=run_blender_job,
+            find_blender=find_blender,
+            resolve_threshold_path=resolve_threshold_path,
+            load_thresholds=load_thresholds,
+            choose_adaptive_inspection_settings=choose_adaptive_inspection_settings,
+            write_runtime_inspection_metadata=write_runtime_inspection_metadata,
+            load_rows=load_rows,
+            resolve_image_paths=resolve_image_paths,
+            load_gradio=_load_gradio,
+            progress_update=_progress_update,
+        ),
     )
-    if not source_candidates:
-        raise ValueError("The runtime job no longer contains the original .blend/.fbx/.obj copy.")
-    source = source_candidates[0]
-    blender = blender_text.strip() or find_blender()
-    if blender != "blender" and not Path(blender).exists():
-        raise ValueError(f"Blender executable not found: {blender}")
-    threshold_path = resolve_threshold_path(threshold_text)
-    thresholds = load_thresholds(threshold_path)
-    job_dir = RUNTIME_DIR / f"repair_{uuid.uuid4().hex[:10]}"
-    job_dir.mkdir(parents=True, exist_ok=True)
-    repaired_output = job_dir / "repaired_asset.blend"
-    adaptive = choose_adaptive_inspection_settings(source, thresholds)
-    runtime_threshold_path = job_dir / "inspection_thresholds.runtime.json"
-    runtime_thresholds = dict(thresholds)
-    runtime_thresholds.update({key: adaptive[key] for key in ("preview_views", "preview_resolution", "max_diagnostic_triangles")})
-    runtime_thresholds["runtime_inspection_strategy"] = adaptive["strategy"]
-    runtime_threshold_path.write_text(json.dumps(runtime_thresholds, ensure_ascii=False, indent=2), encoding="utf-8")
-    command = [
-        blender, "-b", "-P", str(ROOT / "blender" / "inspect_asset.py"), "--",
-        "--input", str(source), "--out", str(job_dir), "--views", str(adaptive["preview_views"]), "--resolution", str(adaptive["preview_resolution"]),
-        "--repair", "--repaired-output", str(repaired_output), "--config", str(runtime_threshold_path),
-    ]
-    log_path = run_blender_job(command, job_dir, progress, timeout=max(300, int(thresholds["job_timeout_seconds"])))
-    repaired_manifest = job_dir / "manifest.jsonl"
-    if not repaired_manifest.exists():
-        raise RuntimeError("Repair completed without producing a new runtime manifest.")
-    write_runtime_inspection_metadata(repaired_manifest, adaptive)
-    rows, _ = load_rows(repaired_manifest)
-    row = rows[0]
-    paths = resolve_image_paths(row, repaired_manifest)
-    info = {
-        "source_file": source.name,
-        "runtime_job": str(job_dir),
-        "repaired_output": str(repaired_output),
-        "log_file": str(log_path),
-        "repair_applied": True,
-        "adaptive_inspection": adaptive,
-        "metadata": compact_metadata(row["metadata"]),
-    }
-    gr = _load_gradio()
-    sample_update = gr.Dropdown(choices=[row["id"]], value=row["id"], label="Test asset")
-    return str(repaired_manifest), sample_update, info, paths["views"], paths["uv"] or None, paths["uv_heatmap"] or None, paths["normal"] or None, paths["model"] or None, paths["model_overlay"] or None, f"Repaired a runtime copy and re-inspected: {source.name} | strategy: {adaptive['strategy']} ({adaptive['preview_views']} views / {adaptive['preview_resolution']}px) | log: {log_path}"
 
 
-def generate_demo_asset(blender_text: str, threshold_text: str, asset_family: str, defect: str, progress: Any = _DEFAULT_PROGRESS) -> tuple[str, str, dict[str, Any], str, str, str, str, str, str, str]:
+def prepare_uploaded_asset(file_path: str | None, blender_text: str, threshold_text: str = str(DEFAULT_THRESHOLDS), progress: Any = _DEFAULT_PROGRESS) -> tuple[str, Any, dict[str, Any], str, str | None, str | None, str | None, str | None, str | None, str, str, str]:
+    """Compatibility wrapper delegating upload preparation to :class:`AssetService`."""
+    prepared = _asset_service().prepare_uploaded_asset(file_path, blender_text, threshold_text, progress)
+    return (*prepared[:9], render_interactive_locator_html(prepared[7], issue_overlay_path=prepared[8]), prepared[9], str(prepared[2].get("task_id", "")))
+
+
+def describe_uploaded_asset(file_value: Any) -> str:
+    """Show immediate upload feedback before the slower Blender preparation."""
+    try:
+        path_text = AssetService.normalize_uploaded_path(file_value)
+    except ValueError as exc:
+        return f"**上传选择无效 / Invalid upload selection:** {html.escape(str(exc))}"
+    if not path_text:
+        return "尚未选择资产。请选择一个 `.blend`、`.fbx` 或 `.obj` 文件。"
+    path = Path(path_text)
+    if not path.exists():
+        return f"**已收到文件值，但本地临时文件不存在 / Uploaded path is unavailable:** `{html.escape(str(path))}`"
+    size_mb = path.stat().st_size / (1024 * 1024)
+    return f"已选择：`{html.escape(path.name)}`（{size_mb:.1f} MB）。点击 **Prepare uploaded asset** 开始检测。"
+
+
+def repair_and_reinspect(file_path: str, blender_text: str, threshold_text: str = str(DEFAULT_THRESHOLDS), progress: Any = _DEFAULT_PROGRESS) -> tuple[str, Any, dict[str, Any], str, str | None, str | None, str | None, str | None, str | None, str, str, str]:
+    """Compatibility wrapper delegating repair/re-inspection to :class:`AssetService`."""
+    prepared = _asset_service().repair_and_reinspect(file_path, blender_text, threshold_text, progress)
+    return (*prepared[:9], render_interactive_locator_html(prepared[7], issue_overlay_path=prepared[8]), prepared[9], str(prepared[2].get("task_id", "")))
+
+
+def generate_demo_asset(blender_text: str, threshold_text: str, asset_family: str, defect: str, progress: Any = _DEFAULT_PROGRESS) -> tuple[str, str, dict[str, Any], str, str, str, str, str, str, str, str, str]:
     """Generate a controlled local fixture and put it through the upload path."""
     blender = blender_text.strip() or find_blender()
     if blender != "blender" and not Path(blender).exists():
@@ -590,25 +578,73 @@ def generate_demo_asset(blender_text: str, threshold_text: str, asset_family: st
     generation_log = run_blender_job(command, generation_dir, progress, timeout=180)
     if not output.exists():
         raise RuntimeError(f"Demo asset generation finished without producing: {output}. Log: {generation_log}")
-    prepared = prepare_uploaded_asset(str(output), blender, str(threshold_path), progress)
+    prepared = _asset_service().prepare_uploaded_asset(str(output), blender, str(threshold_path), progress)
     info = dict(prepared[2])
     info["generated_family"] = asset_family
     info["requested_defect"] = defect
     info["generated_file"] = str(output)
     info["generation_log_file"] = str(generation_log)
-    return prepared[0], prepared[1], info, prepared[3], prepared[4], prepared[5], prepared[6], prepared[7], prepared[8], f"Generated and prepared: {asset_family} / {defect} | logs: {generation_log}, {info['log_file']}"
+    return prepared[0], prepared[1], info, prepared[3], prepared[4], prepared[5], prepared[6], prepared[7], prepared[8], render_interactive_locator_html(prepared[7], issue_overlay_path=prepared[8]), f"Generated and prepared: {asset_family} / {defect} | logs: {generation_log}, {info['log_file']}", str(info.get("task_id", ""))
+
+
+def _safe_runtime_path(root: Path, relative_path: Any) -> str | None:
+    """Resolve a manifest path only when it stays inside its runtime job."""
+    if not relative_path or not isinstance(relative_path, (str, Path)):
+        return None
+    root = root.resolve()
+    candidate = (root / str(relative_path)).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return None
+    return str(candidate) if candidate.is_file() else None
 
 
 def resolve_image_paths(row: dict[str, Any], manifest: Path) -> dict[str, Any]:
     root = manifest.resolve().parent
     images = row.get("images", {})
-    views = [str((root / item).resolve()) for item in images.get("views", [])]
-    uv = str((root / images["uv"]).resolve()) if images.get("uv") else None
-    uv_heatmap = str((root / images["uv_heatmap"]).resolve()) if images.get("uv_heatmap") else None
-    normal = str((root / images["normal"]).resolve()) if images.get("normal") else None
-    model = str((root / images["model"]).resolve()) if images.get("model") else None
-    model_overlay = str((root / images["model_overlay"]).resolve()) if images.get("model_overlay") else None
-    return {"views": views, "uv": uv, "uv_heatmap": uv_heatmap, "normal": normal, "model": model, "model_overlay": model_overlay}
+    if not isinstance(images, dict):
+        images = {}
+    artifacts = row.get("artifacts", {}) or {}
+    if not isinstance(artifacts, dict):
+        artifacts = {}
+    metadata = row.get("metadata", {}) or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    locator_relative = artifacts.get("issue_locator") or metadata.get("issue_locator_file")
+    selection_script_relative = artifacts.get("issue_selection_script") or metadata.get("issue_selection_script_file")
+    view_items = images.get("views", [])
+    if not isinstance(view_items, list):
+        view_items = []
+    views = [path for item in view_items if (path := _safe_runtime_path(root, item))]
+    uv = _safe_runtime_path(root, images.get("uv"))
+    uv_heatmap = _safe_runtime_path(root, images.get("uv_heatmap"))
+    normal = _safe_runtime_path(root, images.get("normal"))
+    model = _safe_runtime_path(root, images.get("model"))
+    model_overlay = _safe_runtime_path(root, images.get("model_overlay"))
+    issue_locator = _safe_runtime_path(root, locator_relative)
+    issue_selection_script = _safe_runtime_path(root, selection_script_relative)
+    return {"views": views, "uv": uv, "uv_heatmap": uv_heatmap, "normal": normal, "model": model, "model_overlay": model_overlay, "issue_locator": issue_locator, "issue_selection_script": issue_selection_script}
+
+
+def _rule_engine() -> RuleEngine:
+    return RuleEngine(
+        RuleEngineDependencies(
+            default_thresholds=DEFAULT_THRESHOLDS,
+            load_thresholds=load_thresholds,
+            resolve_asset_profile=resolve_asset_profile,
+            boundary_policy_for_profile=boundary_policy_for_profile,
+            build_issue_details=build_issue_details,
+            build_complex_warnings=build_complex_warnings,
+            build_inspection_sections=build_inspection_sections,
+            build_asset_readiness=build_asset_readiness,
+            build_confidence_report=build_confidence_report,
+            build_inspection_coverage=build_inspection_coverage,
+            build_inspection_coverage_details=build_inspection_coverage_details,
+            build_unified_issues=build_unified_issues,
+            prioritize_issue_cards=prioritize_issue_cards,
+        )
+    )
 
 
 def run_rule(
@@ -620,71 +656,18 @@ def run_rule(
     thresholds: dict[str, Any] | None = None,
     asset_profile: str = "Auto",
 ) -> dict[str, Any]:
-    metadata = row.get("metadata", {})
-    thresholds = thresholds or load_thresholds()
-    resolved_profile = resolve_asset_profile(asset_profile, metadata, target_face_budget)
-    started = time.perf_counter()
-    defects = infer_defects(
-        metadata,
-        uv_threshold=float(thresholds["max_uv_overlap_ratio"]),
-        stretch_ratio=float(thresholds["max_triangle_aspect_p95"]),
-        boundary_policy=boundary_policy_for_profile(resolved_profile),
-    )
-    uv_analyzed = int(metadata.get("uv_analysis_analyzed_triangle_count", 0) or 0)
-    uv_valid = int(metadata.get("uv_valid_triangle_count", 0) or 0)
-    uv_invalid = bool(
-        "uv_valid_triangle_count" in metadata
-        and metadata.get("uv_status") == "present"
-        and uv_analyzed > 0
-        and uv_valid / uv_analyzed < 0.99
-    )
-    prediction: dict[str, Any] = {
-        "quality": "pass" if not defects and not uv_invalid else "fail",
-        "defect_types": defects,
-        "severity": "high" if uv_invalid else infer_severity(defects),
-        "asset_profile": resolved_profile,
-    }
-    repair = {
-        "non_manifold": "merge or separate non-manifold components",
-        "uv_overlap": "repack overlapping UV islands",
-        "flipped_normals": "recalculate and validate face normals",
-        "hole": "fill boundary loops and inspect watertightness",
-        "stretched_triangles": "rebuild stretched regions with better topology",
-        "degenerate_faces": "remove zero-area faces and re-triangulate",
-    }
-    # Runtime/generated assets use ``quality_summary`` rather than the
-    # benchmark's repair-planning question, but the web demo should still
-    # provide actionable feedback to the operator.
-    prediction["repair_plan"] = [repair[name] for name in defects]
-    if uv_invalid:
-        prediction["repair_plan"].append("re-unwrap UVs and confirm non-zero UV triangle areas")
-    if not prediction["repair_plan"]:
-        prediction["repair_plan"] = ["no repair required"]
-    prediction["issue_details"] = build_issue_details(metadata, defects)
-    prediction["warnings"] = build_complex_warnings(metadata, resolved_profile)
-    prediction["inspection_sections"] = build_inspection_sections(metadata, defects)
-    prediction["asset_readiness"] = build_asset_readiness(metadata)
-    prediction["confidence_report"] = build_confidence_report(metadata, defects, target_face_budget, thresholds)
-    prediction["inspection_coverage"] = build_inspection_coverage(metadata)
-    prediction["inspection_coverage_details"] = build_inspection_coverage_details(metadata)
-    prediction["issues"] = build_unified_issues(metadata, prediction, target_face_budget, thresholds)
-    prediction["health_score"] = compute_health_score(
-        metadata,
-        defects,
+    """Compatibility wrapper delegating deterministic evaluation to RuleEngine."""
+    result = _rule_engine().evaluate(
+        row,
         target_face_budget,
         reference_image_provided,
         prompt_provided,
         soft_model_used,
-        int(thresholds["max_faces"]),
-        asset_profile=resolved_profile,
+        thresholds,
+        asset_profile,
     )
-    prediction["issues"] = prioritize_issue_cards(prediction["issues"], prediction["health_score"])
-    return {
-        "prediction": prediction,
-        "latency_ms": round((time.perf_counter() - started) * 1000, 2),
-        "model": "deterministic_rule_baseline",
-        "schema_valid": True,
-    }
+    result["prediction"]["detector_plugins"] = DETECTOR_PLUGIN_STATUS
+    return result
 
 
 def build_confidence_report(metadata: dict[str, Any], defects: list[str], target_face_budget: str, thresholds: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -772,11 +755,13 @@ def build_inspection_coverage(metadata: dict[str, Any]) -> dict[str, str]:
         uv_state = f"sampled:{analyzed}/{total} ({ratio}%)"
     else:
         uv_state = "checked" if uv_available else "not_checked"
+    runtime_state = "checked" if has_runtime_statistics(metadata) else "not_checked"
     return {
         "geometry": "checked" if metadata.get("vertex_count") and metadata.get("face_count") else "not_checked",
         "uv": uv_state,
-        "materials": "checked" if "texture_image_count" in metadata else "not_checked",
-        "animation": "not_applicable" if not metadata.get("source_has_armature") and not metadata.get("source_has_animation") else "checked",
+        "materials": "checked" if has_material_statistics(metadata) else "not_checked",
+        "animation": animation_coverage_status(metadata),
+        "runtime": runtime_state,
     }
 
 
@@ -809,7 +794,23 @@ def build_inspection_coverage_details(metadata: dict[str, Any]) -> dict[str, dic
         else:
             uv_note_zh = "已分析全部可用 UV 三角形。"
             uv_note_en = "All available UV triangles were analyzed."
-    animation_present = bool(metadata.get("source_has_armature") or metadata.get("source_has_animation"))
+    animation_present = animation_is_present(metadata)
+    animation_status = animation_coverage_status(metadata)
+    animation_inspection_status = str(metadata.get("animation_inspection_status", "") or "")
+    runtime_checked = has_runtime_statistics(metadata)
+    material_stats_available = has_material_statistics(metadata)
+    if animation_status == "sampled":
+        animation_note_zh = "已检查骨骼/动画基础数据；变形自交仅覆盖采样姿态，不能代表全部动画帧。"
+        animation_note_en = "Rig and animation basics were checked; deformation self-intersection was sampled and does not cover every frame."
+    elif animation_inspection_status == "binding_only":
+        animation_note_zh = "已检查蒙皮绑定、顶点权重和骨骼修改器；资产没有可供播放采样的动作，因此未验证动画姿态。"
+        animation_note_en = "Skin binding, vertex weights, and armature modifiers were checked; no action was available for pose sampling, so animation poses were not verified."
+    elif animation_status == "not_checked" and animation_present:
+        animation_note_zh = "检测到骨骼或动画数据，但当前没有可执行的蒙皮姿态采样，不能据此判断动画可播放。"
+        animation_note_en = "Armature or animation data was found, but no executable skinning pose sample was available; animation playability cannot be concluded."
+    else:
+        animation_note_zh = "资产包含骨骼或动画，已执行动画/蒙皮检查。" if animation_present else "资产没有骨骼或动画，因此该项不适用。"
+        animation_note_en = "The asset contains armatures or animation and was checked for animation/skinning." if animation_present else "The asset has no armature or animation, so this check is not applicable."
     return {
         "geometry": {
             "status": "checked" if metadata.get("vertex_count") and metadata.get("face_count") else "not_checked",
@@ -827,18 +828,25 @@ def build_inspection_coverage_details(metadata: dict[str, Any]) -> dict[str, dic
             "note_en": uv_note_en,
         },
         "materials": {
-            "status": "checked" if "texture_image_count" in metadata else "not_checked",
+            "status": "checked" if material_stats_available else "not_checked",
             "observed": f"materials={metadata.get('material_count', '—')}, images={metadata.get('texture_image_count', '—')}, PBR issues={metadata.get('pbr_channel_issue_count', '—')}",
-            "coverage_ratio": 1.0 if "texture_image_count" in metadata else 0.0,
-            "note_zh": "已检查材质、图片贴图和 PBR 通道统计。" if "texture_image_count" in metadata else "没有材质检测统计。",
-            "note_en": "Materials, image textures, and PBR channel statistics were checked." if "texture_image_count" in metadata else "No material inspection statistics were available.",
+            "coverage_ratio": 1.0 if material_stats_available else 0.0,
+            "note_zh": "已检查材质、图片贴图和 PBR 通道统计。" if material_stats_available else "没有材质检测统计。",
+            "note_en": "Materials, image textures, and PBR channel statistics were checked." if material_stats_available else "No material inspection statistics were available.",
         },
         "animation": {
-            "status": "checked" if animation_present else "not_applicable",
+            "status": animation_status,
             "observed": f"armatures={metadata.get('source_armature_count', 0)}, actions={metadata.get('animation_action_count', 0)}, rigged_meshes={metadata.get('rigged_mesh_count', 0)}",
-            "coverage_ratio": 1.0 if animation_present else None,
-            "note_zh": "资产包含骨骼或动画，已执行动画/蒙皮检查。" if animation_present else "资产没有骨骼或动画，因此该项不适用。",
-            "note_en": "The asset contains armatures or animation and was checked for animation/skinning." if animation_present else "The asset has no armature or animation, so this check is not applicable.",
+            "coverage_ratio": 0.5 if animation_status == "sampled" else 1.0 if animation_inspection_status == "binding_only" else 0.0 if animation_present else None,
+            "note_zh": animation_note_zh,
+            "note_en": animation_note_en,
+        },
+        "runtime": {
+            "status": "checked" if runtime_checked else "not_checked",
+            "observed": f"loading_risk={metadata.get('loading_risk', '—')}, estimated_load_time_ms={metadata.get('estimated_load_time_ms', '—')}, draw_call_risk={metadata.get('draw_call_risk', '—')}",
+            "coverage_ratio": 1.0 if runtime_checked else 0.0,
+            "note_zh": "已检查文件体积、加载风险或运行时资源统计。" if runtime_checked else "没有足够的运行时性能统计。",
+            "note_en": "File size, loading risk, or runtime resource statistics were checked." if runtime_checked else "Insufficient runtime performance statistics were available.",
         },
     }
 
@@ -875,6 +883,13 @@ def build_unified_issues(metadata: dict[str, Any], prediction: dict[str, Any], t
             object_rows.sort(key=lambda item: int((item.get("related_face_counts", {}) or {}).get(defect, 0) or 0), reverse=True)
             location["object_names"] = [str(item.get("object_name", "—")) for item in object_rows[:8]]
             location["object_count"] = len(object_rows)
+            location["face_index_space"] = str((object_rows[0] if object_rows else {}).get("face_index_space", "source_mesh_base"))
+            location["identity_validation"] = "object_name_then_topology_fingerprint"
+            location["object_selectors"] = [
+                item.get("object_selector", {})
+                for item in object_rows[:8]
+                if isinstance(item.get("object_selector"), dict)
+            ]
         return location
 
     issues: list[dict[str, Any]] = []
@@ -964,7 +979,33 @@ def build_unified_issues(metadata: dict[str, Any], prediction: dict[str, Any], t
             "fix_en": warning.get("suggestion_en", ""),
             "recheck_zh": "复检对应结构指标并确认符合目标平台要求。",
             "recheck_en": "Recheck the structural metric against the target-platform requirement.",
-            "locator": {"asset": "asset_info", "label_zh": "资产信息 / 材质统计", "label_en": "Asset information / material statistics"},
+            "locator": {
+                "asset": "asset_info",
+                "label_zh": "资产信息 / 材质统计",
+                "label_en": "Asset information / material statistics",
+                "material_names": sorted({
+                    str(item.get("material", "—"))
+                    for item in warning.get("material_details", [])
+                })[:8],
+                "object_names": sorted({
+                    str(object_name)
+                    for item in warning.get("material_details", [])
+                    for object_name in item.get("object_names", []) or []
+                } | {str(object_name) for object_name in warning.get("object_names", []) or []})[:8],
+                "object_count": int(warning.get("object_count", 0) or 0) or len({
+                    str(object_name)
+                    for item in warning.get("material_details", [])
+                    for object_name in item.get("object_names", []) or []
+                } | {str(object_name) for object_name in warning.get("object_names", []) or []}),
+                "objects": [
+                    object_item
+                    for item in warning.get("material_details", [])
+                    for object_item in item.get("objects", []) or []
+                ][:32] + [
+                    {"object_name": str(object_name)}
+                    for object_name in warning.get("object_names", []) or []
+                ][:32],
+            },
             "coverage": coverage.get("materials" if code == "pbr_channel_wiring" else "geometry", "checked"),
         })
     linked_metrics = {threshold_map.get(detail.get("defect_type")) for detail in details}
@@ -1011,7 +1052,7 @@ def build_unified_issues(metadata: dict[str, Any], prediction: dict[str, Any], t
             "locator": {"asset": "uv" if is_uv_validity else "model", "label_zh": "UV 诊断图" if is_uv_validity else ("3D 预览 / 面数统计" if is_face_budget else "3D 预览 / 拓扑统计"), "label_en": "UV diagnostic" if is_uv_validity else ("3D preview / face-count statistics" if is_face_budget else "3D preview / topology statistics")},
             "coverage": coverage.get("uv" if is_uv_validity else "geometry", "checked"),
         })
-    return issues
+    return normalize_issue_list(issues, metadata)
 
 
 def prioritize_issue_cards(issues: list[dict[str, Any]], health: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1119,6 +1160,18 @@ def build_issue_details(metadata: dict[str, Any], defects: list[str]) -> list[di
 def build_complex_warnings(metadata: dict[str, Any], asset_profile: str = "Auto") -> list[dict[str, Any]]:
     """Report imported-asset conditions that are not automatically failures."""
     warnings = []
+    source_mesh_objects = [
+        item for item in (metadata.get("source_mesh_objects", []) or [])
+        if isinstance(item, dict)
+    ]
+
+    def object_names_where(predicate: Any) -> list[str]:
+        return [
+            str(item.get("name", "—"))
+            for item in source_mesh_objects
+            if predicate(item)
+        ][:8]
+
     if metadata.get("pbr_channel_issue_count", 0) > 0:
         material_details = build_pbr_issue_breakdown(metadata)
         material_summary = "; ".join(
@@ -1128,12 +1181,12 @@ def build_complex_warnings(metadata: dict[str, Any], asset_profile: str = "Auto"
         warnings.append({
             "code": "pbr_channel_wiring",
             "level": "warning",
-            "evidence": f"pbr_channel_issue_count={metadata.get('pbr_channel_issue_count')}, material_count={metadata.get('material_count', 'not recorded')}; material_issue_summary={material_summary or 'not recorded'}",
+            "evidence": f"pbr_channel_issue_count={metadata.get('pbr_channel_issue_count')}, unresolved_node_chain_count={metadata.get('pbr_unresolved_chain_count', 0)}, orphan_image_texture_count={metadata.get('orphan_image_texture_count', 0)}, material_count={metadata.get('material_count', 'not recorded')}, packed_texture_count={metadata.get('packed_texture_count', 0)}, udim_image_count={metadata.get('udim_image_count', 0)}, material_uv_map_names={metadata.get('material_uv_map_names', [])}; material_issue_summary={material_summary or 'not recorded'}",
             "material_details": material_details,
             "message_zh": "发现 PBR 通道连接、颜色空间或贴图有效性问题，可能导致材质在目标引擎中失真。",
             "message_en": "PBR channel wiring, color-space, or texture-validity issues were found and may change the material in the target engine.",
-            "suggestion_zh": "逐材质检查 Base Color、Normal、Roughness、Metallic、AO、Opacity、Emissive 的输入来源；数据贴图使用 Non-Color。",
-            "suggestion_en": "Inspect Base Color, Normal, Roughness, Metallic, AO, Opacity, and Emissive sources per material; use Non-Color for data maps.",
+            "suggestion_zh": "逐材质检查 Base Color、Normal、Roughness、Metallic、AO、Opacity、Emissive 的输入来源；确认复杂节点组、Packed/UDIM 贴图和多 UV 通道的目标引擎支持，数据贴图使用 Non-Color。",
+            "suggestion_en": "Inspect Base Color, Normal, Roughness, Metallic, AO, Opacity, and Emissive sources per material; confirm target-engine support for node groups, packed/UDIM textures, and multiple UV channels, and use Non-Color for data maps.",
         })
     missing_images = [
         item for item in (metadata.get("texture_images", []) or [])
@@ -1174,6 +1227,7 @@ def build_complex_warnings(metadata: dict[str, Any], asset_profile: str = "Auto"
         })
     if metadata.get("source_missing_uv_object_count", 0) > 0:
         uv_level = "warning" if metadata.get("texture_image_count", 0) > 0 else "info"
+        missing_uv_objects = object_names_where(lambda item: int(item.get("uv_layer_count", 0) or 0) == 0)
         warnings.append({
             "code": "missing_uv",
             "level": uv_level,
@@ -1182,8 +1236,11 @@ def build_complex_warnings(metadata: dict[str, Any], asset_profile: str = "Auto"
             "message_en": "Some source mesh objects have no UVs; the original state was preserved instead of auto-unwrapping." if uv_level == "warning" else "Some source mesh objects have no UVs; this may be acceptable for untextured assets.",
             "suggestion_zh": "对需要贴图的对象重新展开 UV，并复检重叠、越界、密度和拉伸。",
             "suggestion_en": "Unwrap UVs for textured objects, then recheck overlap, bounds, density, and stretch.",
+            "object_names": missing_uv_objects,
+            "object_count": len(missing_uv_objects),
         })
     if metadata.get("source_unassigned_material_slot_count", 0) > 0:
+        unassigned_slot_objects = object_names_where(lambda item: int(item.get("unassigned_material_slot_count", 0) or 0) > 0)
         warnings.append({
             "code": "unassigned_material_slots",
             "level": "warning",
@@ -1192,20 +1249,36 @@ def build_complex_warnings(metadata: dict[str, Any], asset_profile: str = "Auto"
             "message_en": "Empty material slots were found and may cause material-index mismatches or ineffective draw calls after export.",
             "suggestion_zh": "删除空槽，重新检查每个面的材质索引，并在目标格式中复检。",
             "suggestion_en": "Remove empty slots, validate face material indices, and recheck the exported format.",
+            "object_names": unassigned_slot_objects,
+            "object_count": len(unassigned_slot_objects),
         })
-    if metadata.get("source_negative_scale_object_count", 0) or metadata.get("source_zero_scale_object_count", 0):
+    negative_scale_count = int(metadata.get("source_negative_scale_object_count", 0) or 0)
+    zero_scale_count = int(metadata.get("source_zero_scale_object_count", 0) or 0)
+    non_unit_scale_count = int(metadata.get("source_non_unit_scale_object_count", 0) or 0)
+    if negative_scale_count or zero_scale_count or non_unit_scale_count:
         transform_objects = [
             str(item.get("name", "—")) for item in (metadata.get("source_mesh_objects", []) or [])
             if item.get("negative_scale") or item.get("zero_scale") or item.get("non_unit_scale")
         ]
+        transform_level = "warning" if negative_scale_count or zero_scale_count else "info"
         warnings.append({
             "code": "transform_anomaly",
-            "level": "warning",
-            "evidence": f"negative_scale_objects={metadata.get('source_negative_scale_object_count', 0)}, zero_scale_objects={metadata.get('source_zero_scale_object_count', 0)}, affected_objects={', '.join(transform_objects[:8]) or 'not recorded'}",
-            "message_zh": "发现负缩放或接近零的缩放，可能导致法线翻转、镜像不一致或导出变换异常。",
-            "message_en": "Negative or near-zero object scales were found and may cause flipped normals, mirror inconsistencies, or export-transform issues.",
+            "level": transform_level,
+            "evidence": f"negative_scale_objects={negative_scale_count}, zero_scale_objects={zero_scale_count}, non_unit_scale_objects={non_unit_scale_count}, affected_objects={', '.join(transform_objects[:8]) or 'not recorded'}",
+            "message_zh": (
+                "发现负缩放或接近零的缩放，可能导致法线翻转、镜像不一致或导出变换异常。"
+                if transform_level == "warning"
+                else "发现未应用的非单位缩放；这不一定是错误，但可能造成不同工具之间的尺寸或变换差异。"
+            ),
+            "message_en": (
+                "Negative or near-zero object scales were found and may cause flipped normals, mirror inconsistencies, or export-transform issues."
+                if transform_level == "warning"
+                else "Non-unit object scales were found; this is not necessarily an error, but may cause size or transform differences between tools."
+            ),
             "suggestion_zh": "应用缩放，确认镜像意图，再复检法线、切线和导出坐标。",
             "suggestion_en": "Apply scale, confirm the mirror intent, then recheck normals, tangents, and export coordinates.",
+            "object_names": transform_objects[:8],
+            "object_count": len(transform_objects),
         })
     source_unit_system = str(metadata.get("source_unit_system", "NONE") or "NONE")
     source_unit_scale = float(metadata.get("source_unit_scale_length", 1.0) or 1.0)
@@ -1360,6 +1433,7 @@ def build_pbr_issue_breakdown(metadata: dict[str, Any]) -> list[dict[str, Any]]:
         ),
     }
     details = []
+    material_usage = metadata.get("source_material_usage", {}) or {}
     for report in metadata.get("pbr_material_reports", []) or []:
         raw_issues = [str(issue) for issue in report.get("issues", [])]
         if not raw_issues:
@@ -1378,7 +1452,14 @@ def build_pbr_issue_breakdown(metadata: dict[str, Any]) -> list[dict[str, Any]]:
                 "reason_en": en,
                 "occurrences": occurrences,
             })
-        details.append({"material": str(report.get("name", "—")), "issues": issue_details})
+        material_name = str(report.get("name", "—"))
+        objects = material_usage.get(material_name, []) or []
+        details.append({
+            "material": material_name,
+            "issues": issue_details,
+            "object_names": [str(item.get("object_name", "—")) for item in objects[:32]],
+            "objects": objects[:32],
+        })
     return details[:100]
 
 
@@ -1504,6 +1585,11 @@ def build_asset_readiness(metadata: dict[str, Any]) -> dict[str, Any]:
         rig_errors += 1
     if not metadata.get("source_has_armature") and not metadata.get("source_has_animation"):
         animation_grade = "N/A"
+    elif metadata.get("animation_inspection_status") == "not_checked":
+        animation_grade = "N/A"
+    elif metadata.get("animation_inspection_status") == "binding_only":
+        # Binding can be healthy while animation playback remains unverified.
+        animation_grade = "B" if rig_errors == 0 else "C"
     else:
         animation_grade = "A" if rig_errors == 0 and metadata.get("animation_playability") != "failed_nonfinite_pose_probe" and metadata.get("deformation_self_intersection_check") != "detected_sampled_overlap" else "C"
     return {
@@ -1521,84 +1607,35 @@ def build_asset_readiness(metadata: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def normalize_prediction(prediction: dict[str, Any]) -> dict[str, Any]:
-    """Repair common schema-key variants without changing semantic values."""
-    if not isinstance(prediction, dict):
-        return {"_raw": prediction}
-    normalized = dict(prediction)
-    for source, target in (("repair_plan[]", "repair_plan"), ("defect_types[]", "defect_types")):
-        if target not in normalized and source in normalized:
-            normalized[target] = normalized.pop(source)
-    return normalized
-
-
-def validate_prediction(prediction: dict[str, Any]) -> tuple[bool, list[str]]:
-    errors: list[str] = []
-    if prediction.get("quality") not in {"pass", "fail"}:
-        errors.append("quality must be pass or fail")
-    if prediction.get("severity") not in {"none", "low", "medium", "high"}:
-        errors.append("severity is invalid")
-    defects = prediction.get("defect_types")
-    allowed = {"non_manifold", "uv_overlap", "flipped_normals", "hole", "stretched_triangles", "degenerate_faces"}
-    if not isinstance(defects, list) or not all(item in allowed for item in defects):
-        errors.append("defect_types must be a list of known defect names")
-    if "repair_plan" in prediction and not isinstance(prediction["repair_plan"], list):
-        errors.append("repair_plan must be a list")
-    return not errors, errors
-
-
 def get_vlm(row: dict[str, Any], manifest: Path, condition: str, model_id: str, adapter: Path | None,
             min_pixels: int, max_pixels: int, max_new_tokens: int, offload_dir: Path,
             reference_image: str | None = None, generation_prompt: str = "") -> dict[str, Any]:
-    cache_key = "|".join([model_id, str(adapter or ""), str(min_pixels), str(max_pixels), str(offload_dir)])
-    if cache_key not in _MODEL_CACHE:
-        model, processor = load_stack(
-            model_id,
-            adapter,
-            min_pixels,
-            max_pixels,
-            load_in_4bit=True,
-            offload_dir=offload_dir,
-        )
-        _MODEL_CACHE[cache_key] = (model, processor)
-    model, processor = _MODEL_CACHE[cache_key]
+    """Compatibility wrapper; model loading and inference live in VLMService."""
+    return _VLM_SERVICE.infer(
+        row, manifest, condition, model_id, adapter, min_pixels, max_pixels,
+        max_new_tokens, offload_dir, reference_image, generation_prompt,
+    )
 
-    try:
-        import torch
-        from qwen_vl_utils import process_vision_info
-    except ImportError as exc:
-        raise RuntimeError("VLM mode requires torch and qwen-vl-utils.") from exc
 
-    payload = build_condition(row, condition, manifest)
-    content = [{"type": "image", "image": path} for path in payload["image_paths"]]
-    if reference_image and Path(reference_image).exists():
-        content.append({"type": "image", "image": reference_image})
-    soft_context = []
-    if reference_image:
-        soft_context.append("A reference image was appended after the rendered evidence. Compare the asset to it and describe identity mismatches.")
-    if generation_prompt.strip():
-        soft_context.append(f"Generation prompt to verify: {generation_prompt.strip()}")
-    content.append({"type": "text", "text": payload["prompt"] + ("\n\nSoft evaluation context:\n" + "\n".join(soft_context) if soft_context else "")})
-    messages = [{"role": "user", "content": content}]
-    prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    image_inputs, video_inputs = process_vision_info(messages)
-    inputs = processor(text=[prompt], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt").to(model.device)
-    started = time.perf_counter()
-    with torch.inference_mode():
-        generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
-    trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
-    raw = processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-    prediction = normalize_prediction(parse_json_object(raw))
-    valid, errors = validate_prediction(prediction)
-    return {
-        "prediction": prediction,
-        "raw_output": raw,
-        "latency_ms": round((time.perf_counter() - started) * 1000, 2),
-        "model": model_id,
-        "adapter": str(adapter) if adapter else None,
-        "schema_valid": valid,
-        "schema_errors": errors,
-    }
+def _inspection_service() -> InspectionService:
+    return InspectionService(
+        ROOT,
+        InspectionDependencies(
+            run_rule=run_rule,
+            get_vlm=get_vlm,
+            resolve_asset_profile=resolve_asset_profile,
+            build_issue_details=build_issue_details,
+            build_complex_warnings=build_complex_warnings,
+            build_inspection_sections=build_inspection_sections,
+            build_asset_readiness=build_asset_readiness,
+            build_confidence_report=build_confidence_report,
+            build_inspection_coverage=build_inspection_coverage,
+            build_inspection_coverage_details=build_inspection_coverage_details,
+            build_unified_issues=build_unified_issues,
+            prioritize_issue_cards=prioritize_issue_cards,
+            resolve_image_paths=resolve_image_paths,
+        ),
+    )
 
 
 def build_result(row: dict[str, Any], manifest: Path, mode: str, condition: str, model_id: str,
@@ -1606,143 +1643,12 @@ def build_result(row: dict[str, Any], manifest: Path, mode: str, condition: str,
                  offload_text: str, target_face_budget: str, reference_image: str | None = None,
                  generation_prompt: str = "", thresholds: dict[str, Any] | None = None,
                  asset_profile: str = "Auto") -> tuple[dict[str, Any], dict[str, Any]]:
-    adapter = Path(adapter_text).expanduser() if adapter_text.strip() else None
-    if adapter and not adapter.is_absolute():
-        adapter = (ROOT / adapter).resolve()
-    offload_dir = Path(offload_text).expanduser()
-    if not offload_dir.is_absolute():
-        offload_dir = (ROOT / offload_dir).resolve()
-
-    thresholds = thresholds or load_thresholds()
-    reference_ready = bool(reference_image)
-    prompt_ready = bool(generation_prompt.strip())
-    rule_result = run_rule(
-        row,
-        target_face_budget,
-        reference_ready,
-        prompt_ready,
-        False,
-        thresholds,
-        asset_profile,
+    """Compatibility wrapper; orchestration lives in ``InspectionService``."""
+    return _inspection_service().build_result(
+        row, manifest, mode, condition, model_id, adapter_text, max_new_tokens,
+        min_pixels, max_pixels, offload_text, target_face_budget, reference_image,
+        generation_prompt, thresholds or load_thresholds(), asset_profile,
     )
-    resolved_profile = rule_result["prediction"].get("asset_profile", resolve_asset_profile(asset_profile, row.get("metadata", {}), target_face_budget))
-    vlm_result = None
-    if mode in {"VLM diagnosis", "Hybrid review"}:
-        vlm_result = get_vlm(row, manifest, condition, model_id, adapter, min_pixels, max_pixels, max_new_tokens, offload_dir, reference_image, generation_prompt)
-        rule_result["prediction"]["health_score"] = compute_health_score(
-            row.get("metadata", {}), rule_result["prediction"].get("defect_types", []), target_face_budget,
-            reference_ready, prompt_ready, True,
-            int(thresholds["max_faces"]),
-            asset_profile=resolved_profile,
-        )
-
-    rule_prediction = rule_result["prediction"]
-    vlm_prediction = vlm_result["prediction"] if vlm_result else None
-    if isinstance(vlm_prediction, dict) and "issue_details" not in vlm_prediction:
-        vlm_prediction = dict(vlm_prediction)
-        vlm_prediction["issue_details"] = build_issue_details(
-            row.get("metadata", {}),
-            vlm_prediction.get("defect_types", []) if isinstance(vlm_prediction.get("defect_types"), list) else [],
-        )
-    if isinstance(vlm_prediction, dict) and "warnings" not in vlm_prediction:
-        vlm_prediction = dict(vlm_prediction)
-        vlm_prediction["warnings"] = build_complex_warnings(row.get("metadata", {}), resolved_profile)
-    if isinstance(vlm_prediction, dict) and "inspection_sections" not in vlm_prediction:
-        vlm_prediction = dict(vlm_prediction)
-        vlm_prediction["inspection_sections"] = build_inspection_sections(
-            row.get("metadata", {}),
-            vlm_prediction.get("defect_types", []) if isinstance(vlm_prediction.get("defect_types"), list) else [],
-        )
-    if isinstance(vlm_prediction, dict) and "asset_readiness" not in vlm_prediction:
-        vlm_prediction = dict(vlm_prediction)
-        vlm_prediction["asset_readiness"] = build_asset_readiness(row.get("metadata", {}))
-    if isinstance(vlm_prediction, dict) and "confidence_report" not in vlm_prediction:
-        vlm_prediction = dict(vlm_prediction)
-        vlm_prediction["confidence_report"] = build_confidence_report(
-            row.get("metadata", {}),
-            vlm_prediction.get("defect_types", []) if isinstance(vlm_prediction.get("defect_types"), list) else [],
-            target_face_budget,
-            thresholds,
-        )
-    if isinstance(vlm_prediction, dict) and "health_score" not in vlm_prediction:
-        vlm_prediction = dict(vlm_prediction)
-        vlm_prediction["health_score"] = compute_health_score(
-            row.get("metadata", {}),
-            vlm_prediction.get("defect_types", []) if isinstance(vlm_prediction.get("defect_types"), list) else [],
-            target_face_budget,
-            reference_ready,
-            prompt_ready,
-            bool(vlm_result),
-            int(thresholds["max_faces"]),
-            asset_profile=resolved_profile,
-        )
-    agreement = None
-    review_required = False
-    disagreement_reasons: list[str] = []
-    if vlm_prediction is not None:
-        rule_defects = set(rule_prediction.get("defect_types", []))
-        vlm_defects = set(vlm_prediction.get("defect_types", [])) if isinstance(vlm_prediction.get("defect_types"), list) else set()
-        agreement = round((len(rule_defects & vlm_defects) / len(rule_defects | vlm_defects)) if rule_defects | vlm_defects else 1.0, 3)
-        if rule_defects != vlm_defects:
-            disagreement_reasons.append("rule and VLM defect sets differ")
-        if rule_prediction["quality"] != vlm_prediction.get("quality"):
-            disagreement_reasons.append("rule and VLM quality decisions differ")
-        if rule_prediction.get("severity") != vlm_prediction.get("severity"):
-            disagreement_reasons.append("rule and VLM severity decisions differ")
-        if not vlm_result["schema_valid"]:
-            disagreement_reasons.append("VLM output failed schema validation")
-        # Safety-first policy: any disagreement is routed to human review.
-        review_required = bool(disagreement_reasons)
-
-    if mode == "Rule baseline":
-        selected = rule_prediction
-        selected_source = "rule_baseline"
-    elif mode == "VLM diagnosis":
-        selected = vlm_prediction or rule_prediction
-        selected_source = "vlm"
-    else:
-        # Rules remain the hard gate; VLM adds interpretation and repair text.
-        selected = dict(rule_prediction)
-        if vlm_prediction:
-            if vlm_prediction.get("repair_plan"):
-                selected["repair_plan"] = vlm_prediction["repair_plan"]
-            selected["vlm_quality"] = vlm_prediction.get("quality")
-            selected["vlm_defect_types"] = vlm_prediction.get("defect_types", [])
-            selected["vlm_severity"] = vlm_prediction.get("severity")
-        selected_source = "rule_gate_plus_vlm_explanation"
-
-    selected = dict(selected)
-    selected["asset_profile"] = resolved_profile
-    # The numeric score is always derived from measured hard metrics. VLM
-    # output can add explanations or soft concerns, but it must not replace
-    # the reproducible score with an uncalibrated subjective judgment.
-    selected["health_score"] = rule_prediction.get("health_score")
-    selected["inspection_coverage"] = build_inspection_coverage(row.get("metadata", {}))
-    selected["inspection_coverage_details"] = build_inspection_coverage_details(row.get("metadata", {}))
-    selected["issues"] = build_unified_issues(row.get("metadata", {}), selected, target_face_budget, thresholds)
-    selected["issues"] = prioritize_issue_cards(selected["issues"], selected["health_score"])
-
-    result = {
-        "asset_id": row.get("scene_id", row.get("id")),
-        "sample_id": row["id"],
-        "mode": mode,
-        "condition": condition,
-        "question_type": row.get("question_type"),
-        "selected_source": selected_source,
-        "selected_result": selected,
-        "rule_result": rule_result,
-        "vlm_result": vlm_result,
-        "agreement_score": agreement,
-        "review_required": review_required,
-        "disagreement_reasons": disagreement_reasons,
-        "metadata": compact_metadata(row.get("metadata", {})),
-        "generalization": row.get("generalization"),
-        "soft_inputs": {
-            "reference_image_provided": reference_ready,
-            "generation_prompt_provided": prompt_ready,
-        },
-    }
-    return result, resolve_image_paths(row, manifest)
 
 
 def _format_bytes(value: Any) -> str:
@@ -1794,6 +1700,17 @@ def _render_canonical_issue_cards(result: dict[str, Any], language: str) -> str:
         coverage_label_text = coverage_label(coverage)
         locator_data = issue.get("locator", {})
         locator = locator_data.get("label_zh" if is_zh else "label_en", "—")
+        locator_target = {
+            "model": "#issue-overlay-preview",
+            "uv_heatmap": "#uv-heatmap-preview",
+            "uv": "#uv-diagnostic-preview",
+            "normal": "#normal-diagnostic-preview",
+        }.get(str(locator_data.get("asset", "")))
+        locator_link = (
+            f"<a href='{locator_target}' style='margin-left:8px'>"
+            f"{'查看定位' if is_zh else 'View location'}</a>"
+            if locator_target else ""
+        )
         related_face_count = locator_data.get("related_face_count")
         related_face_line = (
             f"<div><b>关联面数：</b>{html.escape(str(related_face_count))}</div>"
@@ -1801,6 +1718,29 @@ def _render_canonical_issue_cards(result: dict[str, Any], language: str) -> str:
             f"<div><b>Related face count:</b> {html.escape(str(related_face_count))}</div>"
             if not is_zh and related_face_count is not None else ""
         )
+        face_indices = locator_data.get("face_indices") or []
+        face_index_line = ""
+        if face_indices:
+            face_preview = ", ".join(str(index) for index in face_indices[:20])
+            truncated = locator_data.get("face_index_truncated") or len(face_indices) > 20
+            suffix = " …（已截断）" if is_zh and truncated else " … (truncated)" if truncated else ""
+            face_index_line = (
+                f"<div><b>关联面索引：</b><code>{html.escape(face_preview + suffix)}</code></div>"
+                if is_zh else
+                f"<div><b>Related face indices:</b> <code>{html.escape(face_preview + suffix)}</code></div>"
+            )
+        face_space = locator_data.get("face_index_space")
+        identity_validation = locator_data.get("identity_validation")
+        locator_validation_line = ""
+        if face_space or identity_validation:
+            if is_zh:
+                space_label = "原始源网格" if face_space == "source_mesh_base" else str(face_space or "—")
+                validation_label = "对象名优先，拓扑指纹复核" if identity_validation == "object_name_then_topology_fingerprint" else str(identity_validation or "—")
+                locator_validation_line = f"<div><b>定位校验：</b>面索引空间={html.escape(space_label)}；{html.escape(validation_label)}</div>"
+            else:
+                space_label = "source base mesh" if face_space == "source_mesh_base" else str(face_space or "—")
+                validation_label = "object name first, topology fingerprint fallback" if identity_validation == "object_name_then_topology_fingerprint" else str(identity_validation or "—")
+                locator_validation_line = f"<div><b>Locator validation:</b> face-index space={html.escape(space_label)}; {html.escape(validation_label)}</div>"
         object_names = locator_data.get("object_names") or []
         object_line = (
             f"<div><b>问题对象：</b>{html.escape('、'.join(object_names))}"
@@ -1823,7 +1763,29 @@ def _render_canonical_issue_cards(result: dict[str, Any], language: str) -> str:
                     occurrences = int(item.get("occurrences", 1) or 1)
                     occurrence_text = f"（出现 {occurrences} 次）" if is_zh and occurrences > 1 else f" ({occurrences} occurrences)" if not is_zh and occurrences > 1 else ""
                     item_rows.append(f"<li><code>{html.escape(str(channel))}</code>：{html.escape(str(reason))}{html.escape(occurrence_text)}</li>")
-                material_rows.append(f"<li><b>{html.escape(str(material_name))}</b><ul>{''.join(item_rows)}</ul></li>")
+                affected_objects = material.get("objects", []) or []
+                object_rows = []
+                for affected in affected_objects[:12]:
+                    object_name = html.escape(str(affected.get("object_name", "—")))
+                    face_count = affected.get("face_count")
+                    slot_index = affected.get("material_slot_index")
+                    if is_zh:
+                        object_rows.append(
+                            f"<li><code>{object_name}</code>：{html.escape(str(face_count))} 个面，材质槽 {html.escape(str(slot_index))}</li>"
+                        )
+                    else:
+                        object_rows.append(
+                            f"<li><code>{object_name}</code>: {html.escape(str(face_count))} faces, material slot {html.escape(str(slot_index))}</li>"
+                        )
+                object_title = "使用对象 / 面数" if is_zh else "Using objects / faces"
+                object_html = (
+                    f"<div><b>{object_title}：</b><ul>{''.join(object_rows)}</ul></div>"
+                    if object_rows else ""
+                )
+                material_rows.append(
+                    f"<li><b>{html.escape(str(material_name))}</b>"
+                    f"<ul>{''.join(item_rows)}</ul>{object_html}</li>"
+                )
             material_title = "材质 / 通道明细" if is_zh else "Material / channel details"
             material_details_html = f"<div><b>{material_title}：</b><ul>{''.join(material_rows)}</ul></div>"
         current = issue.get("current_value")
@@ -1849,8 +1811,10 @@ def _render_canonical_issue_cards(result: dict[str, Any], language: str) -> str:
             summary = f"严重度：{severity_zh.get(issue.get('severity', 'medium'), issue.get('severity', 'medium'))} · {status_label} · 检测状态：{coverage_label_text} · 档案优先级：{profile_priority}"
             details_html = "".join([
                 f"<div><b>档案排序依据：</b>{html.escape(profile_priority_line)}</div>",
-                f"<div><b>定位证据：</b>{html.escape(str(locator))}</div>",
+                f"<div><b>定位证据：</b>{html.escape(str(locator))}{locator_link}</div>",
                 related_face_line,
+                face_index_line,
+                locator_validation_line,
                 object_line,
                 material_details_html,
                 f"<div><b>当前值 / 阈值：</b>{html.escape(str(threshold_line))}</div>",
@@ -1863,8 +1827,10 @@ def _render_canonical_issue_cards(result: dict[str, Any], language: str) -> str:
             summary = f"Severity: {issue.get('severity', 'medium')} · {status_label} · Coverage: {coverage_label_text} · Profile priority: {profile_priority}"
             details_html = "".join([
                 f"<div><b>Profile ordering:</b> {html.escape(profile_priority_line)}</div>",
-                f"<div><b>Locator:</b> {html.escape(str(locator))}</div>",
+                f"<div><b>Locator:</b> {html.escape(str(locator))}{locator_link}</div>",
                 related_face_line,
+                face_index_line,
+                locator_validation_line,
                 object_line,
                 material_details_html,
                 f"<div><b>Current / threshold:</b> {html.escape(str(threshold_line))}</div>",
@@ -1943,6 +1909,54 @@ def _render_canonical_issue_cards(result: dict[str, Any], language: str) -> str:
             coverage_items.append(f"<li><b>{info_title}</b><ul>{info_items}</ul></li>")
         cards.append(f"<details style='margin:12px 0'><summary style='cursor:pointer;font-weight:700'>{detail_title}</summary><ul>{''.join(coverage_items)}</ul></details>")
     return "<div><style>details div{margin:7px 0} details summary::marker{color:#666}</style>" + "".join(cards) + "</div>"
+
+
+def build_locator_options(result: dict[str, Any], language: str) -> list[tuple[str, str]]:
+    """Build selectable issue locators for the operator-facing locator panel."""
+    is_zh = language == "中文"
+    options: list[tuple[str, str]] = []
+    for issue in result.get("selected_result", {}).get("issues", []) or []:
+        locator = issue.get("locator") or issue.get("location") or {}
+        if not locator or not any(
+            locator.get(key) for key in ("object_names", "face_indices", "related_face_count", "asset")
+        ):
+            continue
+        title = issue.get("title_zh" if is_zh else "title_en", issue.get("issue_id", "issue"))
+        label = f"{title} · {issue.get('issue_id', 'issue')}"
+        options.append((str(label), str(issue.get("issue_id", label))))
+    return options
+
+
+def render_locator_details(issue_id: str | None, result: dict[str, Any] | None) -> dict[str, Any]:
+    """Return one serializable object/face locator record for the selector."""
+    if not issue_id or not isinstance(result, dict):
+        return {"status": "not_selected", "message": "请选择一个问题。"}
+    for issue in result.get("selected_result", {}).get("issues", []) or []:
+        if str(issue.get("issue_id")) != str(issue_id):
+            continue
+        locator = dict(issue.get("locator") or issue.get("location") or {})
+        return {
+            "issue_id": issue.get("issue_id"),
+            "title_zh": issue.get("title_zh"),
+            "title_en": issue.get("title_en"),
+            "status": issue.get("status"),
+            "severity": issue.get("severity"),
+            "blocking": bool(issue.get("blocking", False)),
+            "evidence_asset": locator.get("asset"),
+            "evidence_label_zh": locator.get("label_zh"),
+            "evidence_label_en": locator.get("label_en"),
+            "material_names": locator.get("material_names", []),
+            "object_names": locator.get("object_names", []),
+            "object_count": locator.get("object_count", 0),
+            "objects": locator.get("objects", []),
+            "related_face_count": locator.get("related_face_count", 0),
+            "face_indices": locator.get("face_indices", []),
+            "face_index_count": locator.get("face_index_count", locator.get("related_face_count", 0)),
+            "face_index_truncated": bool(locator.get("face_index_truncated", False)),
+            "face_index_space": locator.get("face_index_space"),
+            "identity_validation": locator.get("identity_validation"),
+        }
+    return {"status": "not_found", "issue_id": issue_id}
 
 
 def render_issue_cards(result: dict[str, Any], language: str) -> str:
@@ -2327,12 +2341,72 @@ def summarize_feedback(result: dict[str, Any], language: str) -> str:
     return "\n\n".join(blocks)
 
 
-def _data_uri(path: str | None) -> str:
-    if not path or not Path(path).exists():
+def render_provenance_summary(result: dict[str, Any], language: str) -> str:
+    """Render reproducibility fields without exposing the full audit payload."""
+    provenance = result.get("provenance", {}) or {}
+    if not isinstance(provenance, dict) or not provenance:
         return ""
-    mime = mimetypes.guess_type(path)[0] or "image/png"
-    encoded = base64.b64encode(Path(path).read_bytes()).decode("ascii")
-    return f"data:{mime};base64,{encoded}"
+    is_zh = language == "中文"
+
+    def text_value(key: str) -> str:
+        value = provenance.get(key)
+        return "—" if value in (None, "", []) else str(value)
+
+    def hash_value(key: str) -> str:
+        value = text_value(key)
+        if value == "—":
+            return value
+        visible = html.escape(value[:16] + ("…" if len(value) > 16 else ""))
+        return f"<code>{visible}</code>"
+
+    labels = (
+        (
+            ("任务 ID", "Task ID"),
+            "task_id",
+        ),
+        (
+            ("检测时间（UTC）", "Detected at (UTC)"),
+            "detected_at_utc",
+        ),
+        (
+            ("检测器版本", "Detector version"),
+            "detector_version",
+        ),
+        (
+            ("输入文件 SHA-256", "Input SHA-256"),
+            "input_sha256",
+        ),
+        (
+            ("生效阈值配置 SHA-256", "Effective threshold SHA-256"),
+            "effective_threshold_config_sha256",
+        ),
+        (
+            ("评分配置 SHA-256", "Scoring config SHA-256"),
+            "scoring_config_sha256",
+        ),
+    )
+    rows = []
+    for (label_zh, label_en), key in labels:
+        value = hash_value(key) if "sha256" in key else html.escape(text_value(key))
+        rows.append(
+            f"<div><b>{html.escape(label_zh if is_zh else label_en)}：</b>{value}</div>"
+        )
+    warnings = list(provenance.get("staging_warnings", []) or [])
+    if warnings:
+        warning_label = "暂存警告" if is_zh else "Staging warnings"
+        warning_text = "；".join(str(item) for item in warnings) if is_zh else "; ".join(str(item) for item in warnings)
+        rows.append(f"<div><b>{warning_label}：</b>{html.escape(warning_text)}</div>")
+    title = "检测追溯 / Inspection traceability"
+    note = (
+        "哈希用于确认输入文件和配置是否发生变化；完整审计记录仍在 Full result / audit record 和下载的 JSON 中。"
+        if is_zh
+        else "Hashes help verify that the input and configurations did not change; the full audit record remains available in Full result / audit record and the JSON download."
+    )
+    return (
+        f"<details><summary style='cursor:pointer;font-weight:700'>{title}</summary>"
+        f"<div style='margin:8px 0;line-height:1.7'>{''.join(rows)}"
+        f"<div style='color:#666'>{html.escape(note)}</div></div></details>"
+    )
 
 
 def summarize_feedback_compact(result: dict[str, Any], language: str) -> str:
@@ -2358,6 +2432,7 @@ def summarize_feedback_compact(result: dict[str, Any], language: str) -> str:
             "inputs_ready": "输入已准备，尚未评分",
             "vlm_assisted": "已由 VLM 辅助解释",
         }.get(soft.get("status"), soft.get("status", "未知"))
+        provenance_html = render_provenance_summary(result, language)
         return (
             f"### 检测总结\n**{html.escape(decision['label'])}** · 健康度 **{health.get('score', '—')}/100（{health.get('grade', '—')}）**。"
             f"档案适配分 **{health.get('profile_fit_score') if health.get('profile_fit_score') is not None else '—'}/100**（{html.escape(_profile_label(str(health.get('asset_profile', '')), language))}，覆盖度 {profile_coverage_text}，置信度 {health.get('profile_fit_confidence', '—')}）。"
@@ -2372,7 +2447,7 @@ def summarize_feedback_compact(result: dict[str, Any], language: str) -> str:
             f"- **检测策略：** {effective_strategy}，预览 {geometry_adaptive.get('effective_views', adaptive.get('preview_views', '—'))} 视图 × {geometry_adaptive.get('effective_resolution', adaptive.get('preview_resolution', '—'))}px，诊断上限 {geometry_adaptive.get('effective_max_diagnostic_triangles', adaptive.get('max_diagnostic_triangles', '—'))} 三角形\n"
             f"- **UV：** 密度 P05 {metadata.get('uv_density_stats', {}).get('p05', '—')}，拉伸 P95 {metadata.get('uv_stretch_stats', {}).get('p95', '—')}，{'采样分析' if metadata.get('uv_analysis_sampled') or metadata.get('uv_overlap_analysis_sampled') else '完整分析'}\n"
             f"- **动画 / 蒙皮：** {readiness.get('animation_grade', '—')}（{readiness.get('animation_playability', '—')}）\n"
-            f"- **软评估：** {soft_text}\n\n</details>"
+            f"- **软评估：** {soft_text}\n\n</details>\n\n{provenance_html}"
         )
     problem_text = ", ".join(problem_names) if problem_names else "No immediate issue detected"
     profile_coverage = health.get("profile_fit_coverage")
@@ -2383,6 +2458,7 @@ def summarize_feedback_compact(result: dict[str, Any], language: str) -> str:
     effective_strategy = " + ".join(filter(None, [adaptive.get("strategy"), geometry_adaptive.get("strategy")])) or "default"
     soft = health.get("soft_evaluation", {})
     soft_text = {"not_available": "not run", "inputs_ready": "inputs ready; not scored", "vlm_assisted": "VLM assisted"}.get(soft.get("status"), soft.get("status", "unknown"))
+    provenance_html = render_provenance_summary(result, language)
     return (
         f"### Inspection summary\n**{html.escape(decision['label'])}** · Health score **{health.get('score', '—')}/100 ({health.get('grade', '—')})**."
         f" Profile fit **{health.get('profile_fit_score') if health.get('profile_fit_score') is not None else '—'}/100** ({html.escape(_profile_label(str(health.get('asset_profile', '')), language))}, coverage {profile_coverage_text}, confidence {health.get('profile_fit_confidence', '—')})."
@@ -2397,54 +2473,8 @@ def summarize_feedback_compact(result: dict[str, Any], language: str) -> str:
         f"- **Inspection strategy:** {effective_strategy}, {geometry_adaptive.get('effective_views', adaptive.get('preview_views', '—'))} views × {geometry_adaptive.get('effective_resolution', adaptive.get('preview_resolution', '—'))}px, diagnostic limit {geometry_adaptive.get('effective_max_diagnostic_triangles', adaptive.get('max_diagnostic_triangles', '—'))} triangles\n"
         f"- **UV:** density P05 {metadata.get('uv_density_stats', {}).get('p05', '—')}, stretch P95 {metadata.get('uv_stretch_stats', {}).get('p95', '—')}, {'sampled' if metadata.get('uv_analysis_sampled') or metadata.get('uv_overlap_analysis_sampled') else 'full'} analysis\n"
         f"- **Animation / skinning:** {readiness.get('animation_grade', '—')} ({readiness.get('animation_playability', '—')})\n"
-        f"- **Soft evaluation:** {soft_text}\n\n</details>"
+         f"- **Soft evaluation:** {soft_text}\n\n</details>\n\n{provenance_html}"
     )
-
-
-def write_report(result: dict[str, Any], paths: dict[str, Any]) -> str:
-    REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    report_path = REPORT_DIR / f"{result['sample_id']}_{int(time.time())}.html"
-    selected = result["selected_result"]
-    cards = "".join(
-        f'<img src="{_data_uri(path)}" alt="view {idx}" style="width:23%;margin:0.5%;border-radius:8px;">'
-        for idx, path in enumerate(paths.get("views", []))
-    )
-    diagnostics = "".join(
-        f'<div style="display:inline-block;width:48%;vertical-align:top;"><h3>{name}</h3><img src="{_data_uri(path)}" style="max-width:100%;border-radius:8px;"></div>'
-        for name, path in (("UV layout", paths.get("uv")), ("UV stretch heatmap", paths.get("uv_heatmap")), ("Normal diagnostic", paths.get("normal")))
-        if path
-    )
-    overlay_path = paths.get("model_overlay")
-    if overlay_path and Path(overlay_path).exists():
-        overlay_uri = _data_uri(overlay_path)
-        diagnostics += (
-            "<div style='display:inline-block;width:48%;vertical-align:top;'>"
-            "<h3>Issue overlay (3D)</h3>"
-            f"<p>This artifact is a GLB model, not a raster image. "
-            f"<a download='issue_overlay.glb' href='{overlay_uri}'>Download 3D overlay</a> "
-            "and open it in a GLB viewer.</p></div>"
-        )
-    language = result.get("feedback_language", "中文")
-    summary_html = render_release_decision(result, language)
-    issue_html = render_issue_cards(result, language)
-    comparison_html = result.get("comparison", "")
-    structured = {
-        "selected_result": {key: selected.get(key) for key in ("quality", "defect_types", "severity", "repair_plan", "asset_profile", "health_score", "asset_readiness", "inspection_coverage", "inspection_coverage_details", "issues")},
-        "metadata": result.get("metadata", {}),
-        "mode": result.get("mode"),
-        "selected_source": result.get("selected_source"),
-        "review_required": result.get("review_required"),
-    }
-    problems_title = "问题卡片" if language == "中文" else "Problems"
-    body = f"""<!doctype html><html><head><meta charset='utf-8'><title>3D Quality Report</title>
-    <style>body{{font-family:Arial,sans-serif;max-width:1100px;margin:32px auto;padding:0 20px;color:#172033}} pre{{background:#f4f6f8;padding:16px;border-radius:8px;overflow:auto;white-space:pre-wrap}} table{{border-collapse:collapse;width:100%}} th,td{{border-bottom:1px solid #e5e7eb;padding:8px;text-align:left}} summary{{cursor:pointer}} </style></head>
-    <body><h1>3D Asset Multimodal Quality Report</h1><p><b>Asset:</b> {html.escape(str(result['asset_id']))} &nbsp; <b>Mode:</b> {html.escape(result['mode'])}</p>
-    <h2>{'决策摘要' if language == '中文' else 'Decision summary'}</h2>{summary_html}<h2>{problems_title}</h2>{issue_html}{comparison_html}
-    <h2>Multi-view evidence</h2><div>{cards}</div><h2>Diagnostic evidence</h2><div>{diagnostics}</div>
-    <details style='margin-top:20px'><summary><b>Structured audit data</b></summary><pre>{html.escape(json.dumps(structured, ensure_ascii=False, indent=2))}</pre></details>
-    </body></html>"""
-    report_path.write_text(body, encoding="utf-8")
-    return str(report_path)
 
 
 def make_app():
@@ -2464,7 +2494,7 @@ def make_app():
         paths = resolve_image_paths(row, manifest)
         metadata = compact_metadata(row.get("metadata", {}))
         info = {"id": row["id"], "scene_id": row.get("scene_id"), "split": row.get("split"), "generalization": row.get("generalization"), "question_type": row.get("question_type"), "question": row.get("question"), "metadata": metadata}
-        return paths["views"], paths["uv"], paths["uv_heatmap"], paths["normal"], paths["model"], paths["model_overlay"], info
+        return paths["views"], paths["uv"], paths["uv_heatmap"], paths["normal"], paths["model"], paths["model_overlay"], info, render_interactive_locator_html(paths["model"], issue_overlay_path=paths.get("model_overlay"))
 
     def inspect(sample_id: str, manifest_text: str, mode: str, feedback_language: str, asset_profile: str, target_face_budget: str, threshold_text: str,
                 reference_image: str | None, generation_prompt: str, condition: str, model_id: str,
@@ -2479,26 +2509,59 @@ def make_app():
             _progress_update(progress, 0.25, "规则统计阶段")
             if mode in {"VLM diagnosis", "Hybrid review"}:
                 _progress_update(progress, 0.45, "VLM 阶段")
+            threshold_path = resolve_threshold_path(threshold_text)
+            thresholds = load_thresholds(threshold_path)
             result, paths = build_result(
                 current_indexed[sample_id], manifest, mode, condition, model_id, adapter_text,
                 max_new_tokens, min_pixels, max_pixels, offload_text, target_face_budget,
-                reference_image, generation_prompt, load_thresholds(resolve_threshold_path(threshold_text)), asset_profile,
+                reference_image, generation_prompt, thresholds, asset_profile,
             )
+            result["provenance"] = build_provenance(
+                manifest,
+                threshold_path,
+                current_indexed[sample_id].get("metadata", {}),
+                mode,
+                condition,
+            )
+            result["artifacts"] = {
+                key: paths[key]
+                for key in ("issue_locator", "issue_selection_script")
+                if paths.get(key)
+            }
             if mode in {"VLM diagnosis", "Hybrid review"}:
                 _progress_update(progress, 0.72, "VLM 阶段")
             _progress_update(progress, 0.86, "报告生成阶段")
         except Exception as exc:
             log_path = manifest.parent / "inspection.log"
-            log_path.write_text(f"{type(exc).__name__}: {exc}\n", encoding="utf-8")
-            raise RuntimeError(f"Inspection failed. Error log: {log_path}") from exc
+            write_failure_log(log_path, "inspection", exc)
+            raise RuntimeError(format_failure_message(exc, log_path)) from exc
         result["feedback_language"] = feedback_language
         previous = inspection_history.get(sample_id)
         result["comparison"] = build_comparison(previous, result, feedback_language)
-        report = write_report(result, paths)
+        result["release_decision"] = build_release_decision(result, feedback_language)
+        report = write_html_report(
+            result,
+            paths,
+            render_release_decision(result, feedback_language),
+            render_issue_cards(result, feedback_language),
+            result["comparison"],
+            REPORT_DIR,
+        )
+        audit_json = write_json_audit(result, REPORT_DIR)
         _progress_update(progress, 1.0, "检测任务完成")
         selected = result["selected_result"]
-        decision = build_release_decision(result, feedback_language)
+        decision = result["release_decision"]
         inspection_history[sample_id] = result
+        locator_options = build_locator_options(result, feedback_language)
+        locator_update = gr.Dropdown(
+            choices=locator_options,
+            value=locator_options[0][1] if locator_options else None,
+            label="Issue locator" if feedback_language != "中文" else "问题定位",
+        )
+        locator_details = render_locator_details(
+            locator_options[0][1] if locator_options else None,
+            result,
+        )
         summary = {
             "status": "REVIEW REQUIRED" if result["review_required"] else selected.get("quality", "unknown").upper(),
             "defect_types": selected.get("defect_types", []),
@@ -2520,10 +2583,41 @@ def make_app():
             "agreement_score": result["agreement_score"],
             "review_required": result["review_required"],
             "disagreement_reasons": result["disagreement_reasons"],
+            "provenance": result.get("provenance", {}),
         }
-        return summary, render_issue_cards(result, feedback_language), render_release_decision(result, feedback_language), result["comparison"], summarize_feedback_compact(result, feedback_language), result, report
+        return summary, render_issue_cards(result, feedback_language), render_release_decision(result, feedback_language), result["comparison"], summarize_feedback_compact(result, feedback_language), result, render_interactive_locator_html(paths["model"], result, feedback_language, paths.get("model_overlay")), report, audit_json, paths.get("issue_locator"), paths.get("issue_selection_script"), locator_update, locator_details
 
-    with gr.Blocks(title="3D Asset Multimodal Quality Inspector", theme=gr.themes.Soft()) as demo:
+    def object_pick(object_name: str | None, result: dict[str, Any] | None):
+        """Map a mesh picked in the browser to the canonical issue locator."""
+        event = {}
+        raw_name = str(object_name or "")
+        if raw_name.lstrip().startswith("{"):
+            try:
+                candidate = json.loads(raw_name)
+                if isinstance(candidate, dict):
+                    event = candidate
+            except json.JSONDecodeError:
+                event = {}
+        picked_name = event.get("object_name") or raw_name
+        selected = resolve_object_pick(
+            picked_name,
+            result,
+            issue_id=event.get("issue_id") or None,
+            face_id=int(event["face_id"]) if str(event.get("face_id", "")).lstrip("-").isdigit() else None,
+        )
+        issue_id = selected.get("issue_id")
+        details = render_locator_details(issue_id, result) if issue_id else selected
+        if event.get("face_id") is not None:
+            details["picked_face_id"] = selected.get("picked_face_id")
+            details["picked_face_coordinate_space"] = selected.get("picked_face_coordinate_space")
+        return issue_id, details
+
+    with gr.Blocks(
+        title="3D Asset Multimodal Quality Inspector",
+        theme=gr.themes.Soft(),
+        css=INTERACTIVE_LOCATOR_CSS,
+        js=INTERACTIVE_LOCATOR_JS,
+    ) as demo:
         gr.Markdown("# 3D Asset Multimodal Quality Inspector\n研究型工业质检原型：规则检测负责可靠性，VLM 负责多模态解释与修复建议。")
         with gr.Row():
             with gr.Column(scale=1):
@@ -2543,13 +2637,36 @@ def make_app():
                         label="Injected defect",
                     )
                     generate_button = gr.Button("Generate and prepare", variant="secondary")
-                asset_upload = gr.File(label="Upload .blend / .fbx / .obj asset", file_types=[".blend", ".fbx", ".obj"], type="filepath")
+                asset_upload = gr.File(
+                    label="Upload .blend / .fbx / .obj asset",
+                    file_types=[".blend", ".fbx", ".obj"],
+                    file_count="single",
+                    type="filepath",
+                )
                 prepare_button = gr.Button("Prepare uploaded asset", variant="secondary")
+                with gr.Row():
+                    local_asset_path = gr.Textbox(
+                        label="Local asset path fallback / 本机文件路径备用入口",
+                        placeholder=r"C:\models\character.fbx",
+                        scale=4,
+                    )
+                    local_path_button = gr.Button("Use local path / 使用本机路径", variant="secondary", scale=1)
                 retry_button = gr.Button("Retry last upload", variant="secondary")
                 repair_button = gr.Button("Auto repair and re-inspect", variant="secondary")
                 cancel_button = gr.Button("Cancel running task", variant="stop")
                 gr.Markdown("修复只作用于运行时副本：合并重复顶点、清理孤立几何、填补孔洞并统一法线，然后重新生成证据。")
-                upload_status = gr.Markdown("Use an existing sample, or upload a .blend / .fbx / .obj file for runtime inspection.")
+                upload_status = gr.Markdown("Use an existing sample, upload a .blend / .fbx / .obj file, or paste a local path if the browser file picker does not respond.")
+                with gr.Accordion("Task control / 任务控制", open=False):
+                    task_id = gr.Textbox(label="Task ID", placeholder="上传或生成后自动填入，也可手动粘贴", interactive=True)
+                    with gr.Row():
+                        query_task_button = gr.Button("Query status / 查询状态", size="sm")
+                        refresh_tasks_button = gr.Button("Refresh history / 刷新历史", size="sm")
+                    background_upload_button = gr.Button("Submit upload in background / 后台提交上传", size="sm")
+                    background_generation_button = gr.Button("Submit generation in background / 后台提交生成", size="sm")
+                    background_repair_button = gr.Button("Submit repair in background / 后台提交修复", size="sm")
+                    load_task_result_button = gr.Button("Load task result / 加载任务结果", variant="secondary")
+                    task_status = gr.JSON(label="Task status / 任务状态", value={"status": "not_selected"})
+                    task_history = gr.JSON(label="Recent tasks / 最近任务", value=list_task_history())
                 sample = gr.Dropdown(choices=sample_ids, value=sample_ids[0], label="Test asset")
                 mode = gr.Radio(["Rule baseline", "VLM diagnosis", "Hybrid review"], value="Rule baseline", label="Inspection mode")
                 feedback_language = gr.Dropdown(["中文", "English"], value="中文", label="Feedback language")
@@ -2567,14 +2684,19 @@ def make_app():
                     offload = gr.Textbox(value="offload/demo_inference", label="Offload directory")
                 inspect_button = gr.Button("Run inspection", variant="primary")
             with gr.Column(scale=2):
-                model_preview = gr.Model3D(value=initial_paths["model"], label="Interactive 3D preview", height=420, display_mode="solid")
-                issue_overlay = gr.Model3D(value=initial_paths["model_overlay"], label="Issue overlay preview", height=360, display_mode="solid")
+                model_preview = gr.Model3D(value=initial_paths["model"], label="Interactive 3D preview", height=420, display_mode="solid", elem_id="model-preview")
+                interactive_locator = gr.HTML(render_interactive_locator_html(initial_paths["model"], issue_overlay_path=initial_paths.get("model_overlay")), label="Object picker / 点击对象定位", elem_id="interactive-locator")
+                object_pick_event = gr.Textbox(value="", visible=False, elem_id="model-pick-event")
+                issue_overlay = gr.Model3D(value=initial_paths["model_overlay"], label="Issue overlay preview", height=360, display_mode="solid", elem_id="issue-overlay-preview")
                 views = gr.Gallery(value=initial_paths["views"], label="Multi-view evidence", columns=4, height="auto")
                 with gr.Row():
-                    uv = gr.Image(value=initial_paths["uv"], label="UV diagnostic", type="filepath")
-                    uv_heatmap = gr.Image(value=initial_paths["uv_heatmap"], label="UV stretch / density heatmap", type="filepath")
-                    normal = gr.Image(value=initial_paths["normal"], label="Normal diagnostic", type="filepath")
+                    uv = gr.Image(value=initial_paths["uv"], label="UV diagnostic", type="filepath", elem_id="uv-diagnostic-preview")
+                    uv_heatmap = gr.Image(value=initial_paths["uv_heatmap"], label="UV stretch / density heatmap", type="filepath", elem_id="uv-heatmap-preview")
+                    normal = gr.Image(value=initial_paths["normal"], label="Normal diagnostic", type="filepath", elem_id="normal-diagnostic-preview")
                 issue_cards = gr.HTML("运行检查后，这里会显示问题卡片。", label="Issue cards")
+                with gr.Accordion("Issue locator / 问题定位", open=False):
+                    locator_choice = gr.Dropdown(choices=[], label="选择问题 / Select issue", interactive=True)
+                    locator_details = gr.JSON(value={"status": "not_selected", "message": "运行检测后选择问题。"}, label="Object and face evidence")
                 decision_badge = gr.HTML("运行检查后，这里会显示发布决策。", label="Release decision")
                 comparison = gr.HTML("运行两次检查后，这里会显示结果对比。", label="Result comparison")
                 feedback = gr.Markdown("运行检查后，这里会显示中文或英文总结。", label="Feedback summary")
@@ -2585,37 +2707,124 @@ def make_app():
                 summary = gr.JSON(label="Inspection result")
             with gr.Accordion("Full result / audit record", open=False):
                 raw_result = gr.JSON(label="Full result / audit record")
-        report = gr.File(label="Download HTML report")
+        with gr.Row():
+            report = gr.File(label="Download HTML report")
+            audit_json = gr.File(label="Download JSON audit")
+            issue_locator_download = gr.File(label="Download issue locator JSON")
+            issue_selection_script_download = gr.File(label="Download Blender face-selection script")
         prepare_event = prepare_button.click(
                 prepare_uploaded_asset,
             inputs=[asset_upload, blender_path, threshold_config],
-            outputs=[manifest, sample, asset_info, views, uv, uv_heatmap, normal, model_preview, issue_overlay, upload_status],
+            outputs=[manifest, sample, asset_info, views, uv, uv_heatmap, normal, model_preview, issue_overlay, interactive_locator, upload_status, task_id],
+            show_progress="minimal",
+        )
+        local_path_event = local_path_button.click(
+            prepare_uploaded_asset,
+            inputs=[local_asset_path, blender_path, threshold_config],
+            outputs=[manifest, sample, asset_info, views, uv, uv_heatmap, normal, model_preview, issue_overlay, interactive_locator, upload_status, task_id],
+            show_progress="minimal",
         )
         generate_event = generate_button.click(
             generate_demo_asset,
             inputs=[blender_path, threshold_config, generated_family, generated_defect],
-            outputs=[manifest, sample, asset_info, views, uv, uv_heatmap, normal, model_preview, issue_overlay, upload_status],
+            outputs=[manifest, sample, asset_info, views, uv, uv_heatmap, normal, model_preview, issue_overlay, interactive_locator, upload_status, task_id],
+            show_progress="minimal",
         )
         repair_event = repair_button.click(
             repair_and_reinspect,
             inputs=[manifest, blender_path, threshold_config],
-            outputs=[manifest, sample, asset_info, views, uv, uv_heatmap, normal, model_preview, issue_overlay, upload_status],
+            outputs=[manifest, sample, asset_info, views, uv, uv_heatmap, normal, model_preview, issue_overlay, interactive_locator, upload_status, task_id],
+            show_progress="minimal",
         )
         retry_event = retry_button.click(
             prepare_uploaded_asset,
             inputs=[asset_upload, blender_path, threshold_config],
-            outputs=[manifest, sample, asset_info, views, uv, uv_heatmap, normal, model_preview, issue_overlay, upload_status],
+            outputs=[manifest, sample, asset_info, views, uv, uv_heatmap, normal, model_preview, issue_overlay, interactive_locator, upload_status, task_id],
+            show_progress="minimal",
         )
-        sample.change(preview, inputs=[sample, manifest], outputs=[views, uv, uv_heatmap, normal, model_preview, issue_overlay, asset_info])
+        # This is a lightweight client-side status update.  It must not wait
+        # behind Blender/VLM jobs in the global Gradio queue; otherwise the
+        # first click after selecting a file can look like it did nothing.
+        # File components emit ``upload`` after the browser has finished
+        # transferring the temporary file.  Using this explicit event is
+        # more reliable than relying only on ``change`` for Gradio 5.x.
+        asset_upload.upload(
+            describe_uploaded_asset,
+            inputs=[asset_upload],
+            outputs=[upload_status],
+            queue=False,
+            show_progress="hidden",
+        )
+        asset_upload.clear(
+            lambda: "尚未选择资产。请选择一个 `.blend`、`.fbx` 或 `.obj` 文件。",
+            outputs=[upload_status],
+            queue=False,
+            show_progress="hidden",
+        )
+        sample.change(
+            preview,
+            inputs=[sample, manifest],
+            outputs=[views, uv, uv_heatmap, normal, model_preview, issue_overlay, asset_info, interactive_locator],
+            queue=False,
+        )
         inspect_event = inspect_button.click(
             inspect,
             inputs=[sample, manifest, mode, feedback_language, asset_profile, target_face_budget, threshold_config, reference_image, generation_prompt, condition, model_id, adapter, max_new_tokens, min_pixels, max_pixels, offload],
-            outputs=[summary, issue_cards, decision_badge, comparison, feedback, raw_result, report],
+            outputs=[summary, issue_cards, decision_badge, comparison, feedback, raw_result, interactive_locator, report, audit_json, issue_locator_download, issue_selection_script_download, locator_choice, locator_details],
+            show_progress="minimal",
+        )
+        locator_choice.change(
+            render_locator_details,
+            inputs=[locator_choice, raw_result],
+            outputs=[locator_details],
+            queue=False,
+        )
+        object_pick_event.change(
+            object_pick,
+            inputs=[object_pick_event, raw_result],
+            outputs=[locator_choice, locator_details],
+            queue=False,
+        )
+        background_upload_button.click(
+            submit_background_upload,
+            inputs=[asset_upload, blender_path, threshold_config],
+            outputs=[task_status, upload_status, task_id, task_history],
+            queue=False,
+        )
+        background_generation_button.click(
+            submit_background_generation,
+            inputs=[blender_path, threshold_config, generated_family, generated_defect],
+            outputs=[task_status, upload_status, task_id, task_history],
+            queue=False,
+        )
+        background_repair_button.click(
+            submit_background_repair,
+            inputs=[manifest, blender_path, threshold_config],
+            outputs=[task_status, upload_status, task_id, task_history],
+            queue=False,
+        )
+        load_task_result_button.click(
+            load_background_task_result,
+            inputs=[task_id],
+            outputs=[manifest, sample, asset_info, views, uv, uv_heatmap, normal, model_preview, issue_overlay, interactive_locator, upload_status, task_status, task_history, task_id],
+            queue=False,
+        )
+        query_task_button.click(
+            query_task_status,
+            inputs=[task_id],
+            outputs=[task_status],
+            queue=False,
+        )
+        refresh_tasks_button.click(
+            list_task_history,
+            outputs=[task_history],
+            queue=False,
         )
         cancel_button.click(
             cancel_running_jobs,
             outputs=[upload_status],
             cancels=[prepare_event, generate_event, repair_event, retry_event, inspect_event],
+            queue=False,
         )
     return demo
 
@@ -2628,4 +2837,4 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--share", action="store_true")
     args = parser.parse_args()
-    make_app().launch(server_name=args.host, server_port=args.port, share=args.share)
+    make_app().launch(server_name=args.host, server_port=args.port, share=args.share, show_error=True)
